@@ -937,20 +937,20 @@ async function handleIncomingMessage(msg) {
     if (isGroupCreationRequest) {
       log('info', '👥 Detected group creation request');
       const groupDetails = parseGroupCreationRequest(text);
-     if (groupDetails) {
-  await handleGroupCreation(msg, groupDetails);
-} else {
-  // Send help message if parsing failed
-  try {
-    await client.sendMessage(msg.from, 
-      '⚠️ Invalid group creation format. Please use:\n\n' +
-      'create group: Group Name | participant1, participant2, ...'
-    );
-  } catch (err) {
-    log('error', `Failed to send help message: ${err.message}`);
-  }
-}
-
+      if (groupDetails) {
+        await handleGroupCreation(msg, groupDetails);
+      } else {
+        // Send help message if parsing failed
+        try {
+          await client.sendMessage(msg.from, 
+            '⚠️ Invalid group creation format. Please use:\n\n' +
+            'create group: Group Name | participant1, participant2, ...'
+          );
+        } catch (err) {
+          log('error', `Failed to send help message: ${err.message}`);
+        }
+      }
+    }
     
   } catch (err) {
     log('error', `Error processing message: ${err.message}`);
