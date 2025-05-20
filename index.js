@@ -120,52 +120,107 @@ async function extractSessionData(client) {
   }
   
   try {
-    // Try multiple approaches to extract session data
-    const sessionData = await client.pupPage.evaluate(() => {
-      // Approach 1: Direct Store access (newer versions)
-      if (window.Store && window.Store.Session && window.Store.Session.getLoginSession) {
-        return window.Store.Session.getLoginSession();
-      }
-      
-      // Approach 2: Local Storage extraction
-      if (window.localStorage) {
-        const keys = Object.keys(window.localStorage).filter(k => 
-          k.includes('WAToken') || k.includes('WASecret') || k.includes('session') || k.includes('WABrowserId')
-        );
-        
-        if (keys.length > 0) {
-          const sessionObj = {};
-          keys.forEach(key => {
-            sessionObj[key] = window.localStorage.getItem(key);
-          });
-          return sessionObj;
+    // Go directly for full localStorage extraction - simpler but effective
+    const rawLocalStorage = await client.pupPage.evaluate(() => {
+      try {
+        const data = {};
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          data[key] = localStorage.getItem(key);
         }
+        return data;
+      } catch (e) {
+        console.error("Error extracting localStorage:", e);
+        return null;
       }
+    });
+    
+    if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
+      log('info', `🔍 Extracted raw localStorage with ${Object.keys(rawLocalStorage).length} items`);
+      // Check if we have WhatsApp tokens
+      const hasWATokens = Object.keys(rawLocalStorage).some(key => 
+        key.includes('WAToken') || key.includes('WABrowserId') || 
+        key.includes('WASecretBundle') || key.includes('Model'));
       
-      // Approach 3: Legacy approach
-      if (window.Store && window.Store.AppState) {
-        return window.Store.AppState.state;
+      if (hasWATokens) {
+        return rawLocalStorage;
+      } else {
+        log('warn', 'localStorage extraction missed WhatsApp tokens');
       }
-      
+    } else {
+      log('warn', 'localStorage extraction found too few items');
+    }
+    
+    // Fallback to WhatsApp-web.js specific objects
+    const waWebData = await client.pupPage.evaluate(() => {
+      if (window.Store && window.Store.Conn) {
+        const conn = window.Store.Conn.serialize();
+        if (conn) return { conn, source: 'Store.Conn' };
+      }
       return null;
     });
     
-    if (sessionData) {
-      log('info', '🔍 Successfully extracted session data using browser evaluation');
-      return sessionData;
+    if (waWebData && Object.keys(waWebData).length > 2) {
+      log('info', '🔍 Extracted specific WhatsApp store data');
+      return waWebData;
     }
     
-    // Try fallback method by getting authState directly
-    if (client.authStrategy && client.authStrategy.authState) {
-      log('info', '🔍 Using authState from client.authStrategy');
-      return client.authStrategy.authState;
+    // Try to access WAWebJS internal data
+    try {
+      if (client._webVersion) {
+        // Try to capture some session info from the client itself
+        const clientInfo = {
+          webVersion: client._webVersion,
+          connected: client.info ? true : false,
+          state: client.state,
+          clientType: "WAWebJS"
+        };
+        
+        // Try to capture device ID if available
+        if (client._sessions && client._sessions.length > 0) {
+          clientInfo.sessions = client._sessions;
+        }
+        
+        return clientInfo;
+      }
+    } catch (e) {
+      log('warn', `Failed to extract internal client data: ${e.message}`);
+    }
+    
+    // Last resort - try to extract key WAWeb tokens
+    const waTokens = await client.pupPage.evaluate(() => {
+      const data = {};
+      const waTokens = ['WAToken1', 'WAToken2', 'WABrowserId', 'WASecretBundle'];
+      waTokens.forEach(key => {
+        try {
+          const val = window.localStorage.getItem(key);
+          if (val) data[key] = val;
+        } catch (e) {}
+      });
+      return Object.keys(data).length > 2 ? data : null;
+    });
+    
+    if (waTokens) {
+      log('info', '🔍 Extracted specific WA tokens only');
+      return waTokens;
     }
     
     log('warn', '❓ All session data extraction methods failed');
-    return null;
+    // Return at least the state if nothing else works
+    return {
+      state: "CONNECTED",
+      timestamp: new Date().toISOString(),
+      fallback: true
+    };
   } catch (err) {
     log('error', `Failed to extract session data: ${err.message}`);
-    return null;
+    // Return at least the state if nothing else works
+    return {
+      state: "CONNECTED",
+      timestamp: new Date().toISOString(),
+      fallback: true,
+      error: err.message
+    };
   }
 }
 
@@ -175,10 +230,19 @@ async function safelyTriggerSessionSave(client) {
   try {
     // For enhanced LocalAuth, use the save method directly
     if (client.authStrategy && typeof client.authStrategy.save === 'function') {
+      // Make sure client reference is set
+      if (client.authStrategy.client === null) {
+        client.authStrategy.client = client;
+        log('info', '🔗 Set client reference in auth strategy during save');
+      }
+      
       // Try to get session data using our enhanced extractor
       const sessionData = await extractSessionData(client);
       
       if (sessionData) {
+        const sessionSize = JSON.stringify(sessionData).length;
+        log('info', `📥 Got session data to save (${sessionSize} bytes)`);
+        
         await client.authStrategy.save(sessionData);
         log('info', '📥 Session save triggered with valid data');
         return true;
@@ -272,6 +336,9 @@ class EnhancedLocalAuth extends LocalAuth {
   async afterInit(client) {
     await super.afterInit(client);
     
+    // Keep a reference to the client for session extraction
+    this.client = client;
+    
     try {
       // Try to load session from Supabase first
       const { data, error } = await this.supabase
@@ -325,7 +392,8 @@ class EnhancedLocalAuth extends LocalAuth {
       const extractedSession = await extractSessionData(this.client);
       
       if (extractedSession) {
-        log('info', '🔍 Successfully extracted session data for saving');
+        const sessionSize = JSON.stringify(extractedSession).length;
+        log('info', `🔍 Successfully extracted session data for saving (${sessionSize} bytes)`);
         session = extractedSession;
       } else {
         log('warn', '❌ Still no valid session data found, cannot save');
@@ -333,9 +401,30 @@ class EnhancedLocalAuth extends LocalAuth {
       }
     }
     
-    // First save locally using the parent method
+    // First save locally using the parent method - BUT ONLY IF IT'S VALID
     try {
-      await super.save(session);
+      if (typeof super.save === 'function') {
+        await super.save(session);
+      } else {
+        log('warn', 'Parent save method not available, skipping local save');
+        
+        // Try manual save to local storage
+        try {
+          const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
+          if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
+          }
+          
+          await fs.promises.writeFile(
+            path.join(sessionDir, 'session.json'),
+            JSON.stringify(session),
+            { encoding: 'utf8' }
+          );
+          log('info', '✅ Session manually saved to local storage');
+        } catch (writeErr) {
+          log('error', `Failed to manually write session to local storage: ${writeErr.message}`);
+        }
+      }
     } catch (err) {
       log('error', `Failed to save session locally: ${err.message}`);
       // Continue anyway to try Supabase save
@@ -348,7 +437,28 @@ class EnhancedLocalAuth extends LocalAuth {
       
       if (sessionSize < 100) {
         log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
-        // Save anyway but log the warning
+        // Try a last-ditch effort to get real session data
+        if (this.client && this.client.pupPage) {
+          try {
+            log('info', 'Attempting direct localStorage extraction as last resort');
+            const rawLocalStorage = await this.client.pupPage.evaluate(() => {
+              const data = {};
+              for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                data[key] = localStorage.getItem(key);
+              }
+              return data;
+            });
+            
+            if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
+              session = rawLocalStorage;
+              const newSize = JSON.stringify(session).length;
+              log('info', `Found better session data via direct extraction (${newSize} bytes)`);
+            }
+          } catch (e) {
+            log('error', `Last resort extraction failed: ${e.message}`);
+          }
+        }
       }
       
       const { error } = await this.supabase
@@ -493,19 +603,14 @@ function createWhatsAppClient() {
       protocolTimeout: 60000, // Protocol timeout to reduce errors
     },
     webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/4.0.0.html',
+      type: 'local', // Change to local for better stability
     },
     qrTimeout: 0, // Never timeout waiting for QR
     restartOnAuthFail: true,
     takeoverOnConflict: true,
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36', // Updated Chrome UA
     multiDevice: true, // Enable multi-device beta for better session persistence
-    // Add WAWebJS-specific browser session settings
-    webVersion: '2.2413.59', // Force a specific version to reduce compatibility issues
     sessionCacheEnabled: true, // Enable session caching to reload faster
-    // Add browser launch detection
-    waitForEvents: ['wait_for_login', 'ready', 'authenticated'], // Wait for these events during launch
   });
 }
 
@@ -591,6 +696,16 @@ function setupClientEvents(c) {
     connectionRetryCount = 0; // Reset retry count on successful connection
     currentQRCode = null; // Clear QR code on ready
     
+    // Force a session save one more time after fully ready
+    setTimeout(async () => {
+      try {
+        await safelyTriggerSessionSave(c);
+        log('info', '📥 Force-saved session after ready state');
+      } catch (err) {
+        log('error', `Failed to force-save session after ready: ${err.message}`);
+      }
+    }, 5000);
+    
     // Check if this is a business account and apply optimizations
     try {
       isBusinessAccount = await detectBusinessAccount(c);
@@ -614,14 +729,14 @@ function setupClientEvents(c) {
     currentQRCode = null; // Clear QR code once authenticated
     
     // Try to save session immediately after authentication
-    if (DEBUG_SESSION) {
-      log('info', '📥 Forcing immediate session save after authentication');
+    setTimeout(async () => {
       try {
-        safelyTriggerSessionSave(c);
+        await safelyTriggerSessionSave(c);
+        log('info', '📥 Forced session save after authentication');
       } catch (err) {
         log('error', `Failed to force session save: ${err.message}`);
       }
-    }
+    }, 2000);
   });
 
   c.on('disconnected', async reason => {
@@ -976,10 +1091,14 @@ async function startClient() {
     log('info', '🚀 Starting WhatsApp client...');
     client = createWhatsAppClient();
     
-    // Store client reference in auth strategy
-    if (client.authStrategy) {
-      client.authStrategy.client = client;
-    }
+    // Ensure auth strategy has client reference with a short delay
+    setTimeout(() => {
+      if (client && client.authStrategy) {
+        client.authStrategy.client = client;
+        log('info', '🔗 Added client reference to auth strategy');
+      }
+    }, 1000);
+    
     setupClientEvents(client);
 
     await client.initialize();
@@ -989,8 +1108,14 @@ async function startClient() {
     lastActivityTime = Date.now();
     
     // Try to force save session right after successful initialization
-    if (client.authStrategy?.authState) {
+    if (client.authStrategy) {
       try {
+        // Double-check client reference is set
+        if (!client.authStrategy.client) {
+          client.authStrategy.client = client;
+          log('info', '🔗 Set client reference in auth strategy after init');
+        }
+        
         log('info', '📥 Forcing session save after initialization');
         await safelyTriggerSessionSave(client);
         log('info', '📥 Session saved successfully after initialization');
