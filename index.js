@@ -1068,8 +1068,10 @@ async function handleGroupCreation(msg, groupDetails) {
     
     log('info', `Formatted participants: ${JSON.stringify(formattedParticipants)}`);
     
-    // For whatsapp-web.js 1.28.0, the best approach is to try to create the group with all participants at once
-    const result = await client.createGroup(groupName, formattedParticipants);
+    // First, create the group with just one participant (or no participants if allowed)
+    // We'll add the other participants later
+    const firstParticipant = formattedParticipants.length > 0 ? [formattedParticipants[0]] : [];
+    const result = await client.createGroup(groupName, firstParticipant);
     
     if (result && result.gid) {
       // Properly handle group ID format
@@ -1079,29 +1081,58 @@ async function handleGroupCreation(msg, groupDetails) {
       
       log('info', `✅ Group created with ID: ${groupId}`);
       
-      // Version 1.28.0 doesn't have a direct method to add participants after creation
-      // Check if all participants were added
+      // Add the rest of the participants (if any)
+      // But we need to wait for the group to be fully created first
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      
+      let addedCount = firstParticipant.length;
+      
       try {
-        // Wait a moment for WhatsApp to fully create the group
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        
-        // Try to get the chat to check participants
-        const chat = await client.getChatById(groupId);
-        if (chat) {
-          // Let the user know the group was created, but mention that not all participants might be added
-          await client.sendMessage(msg.from, 
-            `✅ Group "${groupName}" created successfully! Due to WhatsApp's privacy settings, participants will need to accept invitations to join.`);
-        } else {
-          // Fallback message if we can't get the chat
-          await client.sendMessage(msg.from, 
-            `✅ Group "${groupName}" created. WhatsApp may require participants to accept the invitation.`);
+        if (formattedParticipants.length > firstParticipant.length) {
+          // Get the remaining participants
+          const remainingParticipants = formattedParticipants.slice(firstParticipant.length);
+          
+          // Get the GroupChat object so we can use addParticipants
+          const chat = await client.getChatById(groupId);
+          
+          if (chat.isGroup) {
+            log('info', `👥 Adding ${remainingParticipants.length} more participants to group...`);
+            
+            try {
+              // This is the key line - using the addParticipants method from the GroupChat class
+              const result = await chat.addParticipants(remainingParticipants, {
+                sleep: [1000, 2000], // Add delay between adding participants
+                autoSendInviteV4: true, // Send invites to participants who restricted being added
+                comment: `You've been added to ${groupName}` // Comment for the invite
+              });
+              
+              log('info', `✅ Add participants result: ${JSON.stringify(result)}`);
+              
+              // Check for successful additions
+              if (typeof result === 'object') {
+                for (const [participantId, addResult] of Object.entries(result)) {
+                  if (addResult.code === 200) {
+                    addedCount++;
+                    log('info', `✅ Successfully added ${participantId}`);
+                  } else {
+                    log('warn', `⚠️ Failed to add ${participantId}: ${addResult.message}`);
+                  }
+                }
+              }
+            } catch (addErr) {
+              log('warn', `⚠️ Error adding participants: ${addErr.message}`);
+            }
+          } else {
+            log('warn', '⚠️ Retrieved chat is not a group chat');
+          }
         }
       } catch (chatErr) {
-        log('warn', `Failed to get chat for group ${groupId}: ${chatErr.message}`);
-        // Fallback message
-        await client.sendMessage(msg.from, 
-          `✅ Group "${groupName}" created. WhatsApp may require participants to accept the invitation.`);
+        log('warn', `⚠️ Error retrieving group chat: ${chatErr.message}`);
       }
+      
+      // Send confirmation message
+      await client.sendMessage(msg.from, 
+        `✅ Group "${groupName}" created successfully with ${addedCount}/${formattedParticipants.length} participants added. Some participants may need to accept invitations.`);
       
       // Send welcome message to the new group
       setTimeout(async () => {
@@ -1139,7 +1170,6 @@ async function handleGroupCreation(msg, groupDetails) {
     }
   }
 }
-
 // Improved webhook sender with webhook type parameter
 async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
   if (!webhookUrl) {
