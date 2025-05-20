@@ -1090,7 +1090,17 @@ async function handleGroupCreation(msg, groupDetails) {
         const participant = formattedParticipants[i];
         try {
           log('info', `Adding participant ${participant} to group...`);
-          await client.addParticipant(groupId, participant);
+          
+          // Use the correct method name: groupAdd or addParticipantsToGroup
+          // Try different method names depending on the library version
+          if (typeof client.groupAdd === 'function') {
+            await client.groupAdd(groupId, [participant]);
+          } else if (typeof client.addParticipantsToGroup === 'function') {
+            await client.addParticipantsToGroup(groupId, [participant]);
+          } else {
+            throw new Error('Group participant addition method not available in this version of WhatsApp Web.js');
+          }
+          
           successCount++;
           log('info', `✅ Added participant ${participant} to group`);
           
