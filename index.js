@@ -1048,23 +1048,26 @@ async function handleGroupCreation(msg, groupDetails) {
     // Send acknowledgment that we're working on it
     await client.sendMessage(msg.from, `⏳ Creating group "${groupName}" with ${participants.length} participants. Please wait...`);
     
-    // Format participants as phone numbers with proper formatting
-    const formattedParticipants = participants.map(p => {
-      // Remove any non-numeric characters except + sign
-      let cleaned = p.replace(/[^\d+]/g, '');
-      
-      // If it doesn't have country code or +, add default country code
-      if (!cleaned.startsWith('1') && !cleaned.startsWith('+')) {
-        cleaned = '65' + cleaned; // Using Singapore country code as default
-      }
-      
-      // Make sure it has @ notation for WhatsApp
-      if (!cleaned.includes('@c.us')) {
-        cleaned = cleaned + '@c.us';
-      }
-      
-      return cleaned;
-    });
+   // Format participants as phone numbers with proper formatting
+const formattedParticipants = participants.map(p => {
+  // Remove any non-numeric characters except + sign
+  let cleaned = p.replace(/[^\d+]/g, '');
+  
+  // Check if the number already has the Singapore country code (65)
+  const alreadyHasCountryCode = cleaned.startsWith('65') || cleaned.startsWith('+65');
+  
+  // Only add country code if it doesn't have one already
+  if (!alreadyHasCountryCode && !cleaned.startsWith('1') && !cleaned.startsWith('+')) {
+    cleaned = '65' + cleaned; // Using Singapore country code as default
+  }
+  
+  // Make sure it has @ notation for WhatsApp
+  if (!cleaned.includes('@c.us')) {
+    cleaned = cleaned + '@c.us';
+  }
+  
+  return cleaned;
+});
     
     log('info', `Formatted participants: ${JSON.stringify(formattedParticipants)}`);
     
