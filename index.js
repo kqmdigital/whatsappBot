@@ -22,6 +22,22 @@ const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
 const BOT_VERSION = '2.0.0'; // Combined version
 const startedAt = Date.now();
 
+// Enhanced logging with levels
+const log = (level, message, ...args) => {
+  const timestamp = new Date().toISOString();
+  const formatted = `[${timestamp}] [${level.toUpperCase()}] [${SESSION_ID}] ${message}`;
+  
+  console[level in console ? level : 'log'](formatted, ...args);
+};
+
+// Add debug level specifically for self-pings
+log.debug = (message, ...args) => {
+  const timestamp = new Date().toISOString();
+  const formatted = `[${timestamp}] [DEBUG] [${SESSION_ID}] ${message}`;
+  
+  console.log(formatted, ...args);
+};
+
 // Helper function to download media with retries
 async function downloadMedia(url, options = {}) {
   log('info', `🔽 Downloading media from ${url.substring(0, 50)}...`);
@@ -286,22 +302,6 @@ try {
   console.error('❌ Failed to initialize Supabase client:', error.message);
   process.exit(1);
 }
-
-// Enhanced logging with levels
-const log = (level, message, ...args) => {
-  const timestamp = new Date().toISOString();
-  const formatted = `[${timestamp}] [${level.toUpperCase()}] [${SESSION_ID}] ${message}`;
-  
-  console[level in console ? level : 'log'](formatted, ...args);
-};
-
-// Add debug level specifically for self-pings
-log.debug = (message, ...args) => {
-  const timestamp = new Date().toISOString();
-  const formatted = `[${timestamp}] [DEBUG] [${SESSION_ID}] ${message}`;
-  
-  console.log(formatted, ...args);
-};
 
 // --- Enhanced LocalAuth with Supabase Integration ---
 class EnhancedLocalAuth extends LocalAuth {
@@ -937,20 +937,20 @@ async function handleIncomingMessage(msg) {
     if (isGroupCreationRequest) {
       log('info', '👥 Detected group creation request');
       const groupDetails = parseGroupCreationRequest(text);
-      if (groupDetails) {
-        await handleGroupCreation(msg, groupDetails);
-      } else {
-        // Send help message if parsing failed
-        try {
-          await client.sendMessage(msg.from, 
-            '⚠️ Invalid group creation format. Please use:\n\n' +
-            'create group: Group Name | participant1, participant2, ...'
-          );
-        } catch (err) {
-          log('error', `Failed to send help message: ${err.message}`);
-        }
-      }
-    }
+     if (groupDetails) {
+  await handleGroupCreation(msg, groupDetails);
+} else {
+  // Send help message if parsing failed
+  try {
+    await client.sendMessage(msg.from, 
+      '⚠️ Invalid group creation format. Please use:\n\n' +
+      'create group: Group Name | participant1, participant2, ...'
+    );
+  } catch (err) {
+    log('error', `Failed to send help message: ${err.message}`);
+  }
+}
+
     
   } catch (err) {
     log('error', `Error processing message: ${err.message}`);
