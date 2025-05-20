@@ -2489,4 +2489,4 @@ process.on('SIGINT', async () => {
 });
 
 // Export app for testing if needed
-module.exports = { app, server, client };
+module.exports = { app, server, client };})
