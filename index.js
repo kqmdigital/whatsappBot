@@ -2304,137 +2304,7 @@ const server = app.listen(PORT, () => {
     }
   }, 5 * 60 * 1000); // Check every 5 minutes
   
-  // Additional interval to force session saves periodically
-  setInterval(async () => {
-    if (client && client.authStrategy && client.getState) {
-      try {
-        const state = await client.getState();
-        if (state === 'CONNECTED') {
-          log('info', '📥 Periodic session save triggered');
-          await safelyTriggerSessionSave(client);
-          log('info', '📥 Periodic session save completed');
-        }
-      } catch (err) {
-        log('error', `Failed to perform periodic session save: ${err.message}`);
-      }
-    }
-  }, 10 * 60 * 1000); // Every 10 minutes
-});
-
-// Self-ping mechanism (in addition to UptimeRobot)
-let lastPingSent = 0;
-const selfPing = async () => {
-  try {
-    // Only ping if we haven't received an external ping recently
-    const now = Date.now();
-    if (now - lastPingSent > 4 * 60 * 1000) { // 4 minutes
-      lastPingSent = now;
-      // Get the deployed URL from environment or construct it
-      const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
-      await axios.get(`${appUrl}/ping`, { timeout: 5000 });
-      log.debug('🏓 Self-ping successful');
-    }
-  } catch (err) {
-    log('warn', `Self-ping failed: ${err.message}`);
-  }
-};
-
-// Update request handlers to record external pings
-app.use((req, res, next) => {
-  if (req.path === '/ping') {
-    lastPingSent = Date.now();
-  }
-  next();
-});
-
-// Run self-ping every 4 minutes
-setInterval(selfPing, 4 * 60 * 1000);
-
-// Handle SIGTERM for graceful shutdown
-process.on('SIGTERM', async () => {
-  log('info', '📴 SIGTERM received, shutting down gracefully');
-  
-  // Try to save session before shutdown
-  if (client && client.authStrategy) {
-    try {
-      log('info', '📥 Saving session before shutdown');
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before shutdown');
-    } catch (err) {
-      log('error', `Failed to save session before shutdown: ${err.message}`);
-    }
-  }
-  
-  if (client) {
-    try {
-      await client.destroy();
-      log('info', '🔌 WhatsApp client destroyed');
-    } catch (err) {
-      log('error', `Error during shutdown: ${err.message}`);
-    }
-  }
-  
-  // Try to close server gracefully
-  server.close(() => {
-    log('info', 'HTTP server closed');
-  });
-  
-  // Exit after a short timeout to allow logs to flush
-  setTimeout(() => process.exit(0), 1500);
-});
-
-// Handle SIGINT (Ctrl+C)
-process.on('SIGINT', async () => {
-  log('info', '📴 SIGINT received, shutting down gracefully');
-  
-  // Try to save session before shutdown
-  if (client && client.authStrategy) {
-    try {
-      log('info', '📥 Saving session before shutdown');
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before shutdown');
-    } catch (err) {
-
-// Handle SIGINT (Ctrl+C)
-process.on('SIGINT', async () => {
-  log('info', '📴 SIGINT received, shutting down gracefully');
-  
-  // Try to save session before shutdown
-  if (client && client.authStrategy) {
-    try {
-      log('info', '📥 Saving session before shutdown');
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before shutdown');
-    } catch (err) {
-      log('error', `Failed to save session before shutdown: ${err.message}`);
-    }
-  }
-  
-  if (client) {
-    try {
-      await client.destroy();
-      log('info', '🔌 WhatsApp client destroyed');
-    } catch (err) {
-      log('error', `Error during shutdown: ${err.message}`);
-    }
-  }
-  
-  // Try to close server gracefully
-  server.close(() => {
-    log('info', 'HTTP server closed');
-  });
-  
-  // Exit after a short timeout to allow logs to flush
-  setTimeout(() => process.exit(0), 1500);
-});
-
-// Handle unhandled rejections
-process.on('unhandledRejection', (reason, promise) => {
-  log('error', 'Unhandled Rejection at:', promise, 'reason:', reason);
-  // Don't exit, just log
-});
-
-// Enhanced watchdog with memory monitoring and cleanup
+  // Enhanced watchdog with memory monitoring and cleanup
 setInterval(async () => {
   // First, log memory in exactly the format requested
   const mem = process.memoryUsage();
@@ -2462,123 +2332,123 @@ setInterval(async () => {
     const state = await client.getState();
     log('info', `✅ Watchdog: client state is "${state}".`);
 
-   // Save session on successful watchdog check
-if (state === 'CONNECTED' && client.authStrategy) {
-  try {
-    if (DEBUG_SESSION) {
-      log('info', '📥 Watchdog forcing session save');
+    // Save session on successful watchdog check
+    if (state === 'CONNECTED' && client.authStrategy) {
+      try {
+        if (DEBUG_SESSION) {
+          log('info', '📥 Watchdog forcing session save');
+        }
+        await safelyTriggerSessionSave(client);
+        if (DEBUG_SESSION) {
+          log('info', '📥 Watchdog session save successful');
+        }
+      } catch (err) {
+        log('error', `Failed to save session during watchdog check: ${err.message}`);
+      }
     }
-    await safelyTriggerSessionSave(client);
-    if (DEBUG_SESSION) {
-      log('info', '📥 Watchdog session save successful');
-    }
-  } catch (err) {
-    log('error', `Failed to save session during watchdog check: ${err.message}`);
-  }
-}
 
-// Check if memory exceeds threshold (default 450MB) and perform cleanup if needed
-if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
-  log('warn', `⚠️ Memory usage exceeded ${MEMORY_THRESHOLD_MB}MB (${rssMB}MB). Performing cleanup...`);
-  
-  // Force garbage collection if available
-  if (global.gc) {
-    log('info', '🧹 Running forced garbage collection');
-    global.gc();
-    
-    // Check if garbage collection helped
-    const afterGC = process.memoryUsage();
-    const afterRssMB = (afterGC.rss / 1024 / 1024).toFixed(1);
-    log('info', `🧹 After GC: RSS=${afterRssMB}MB`);
-    
-    // If still too high, restart the client
-    if (parseFloat(afterRssMB) > MEMORY_THRESHOLD_MB) {
-      log('warn', `⚠️ Memory still high after GC. Restarting client...`);
+    // Check if memory exceeds threshold (default 450MB) and perform cleanup if needed
+    if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
+      log('warn', `⚠️ Memory usage exceeded ${MEMORY_THRESHOLD_MB}MB (${rssMB}MB). Performing cleanup...`);
+      
+      // Force garbage collection if available
+      if (global.gc) {
+        log('info', '🧹 Running forced garbage collection');
+        global.gc();
+        
+        // Check if garbage collection helped
+        const afterGC = process.memoryUsage();
+        const afterRssMB = (afterGC.rss / 1024 / 1024).toFixed(1);
+        log('info', `🧹 After GC: RSS=${afterRssMB}MB`);
+        
+        // If still too high, restart the client
+        if (parseFloat(afterRssMB) > MEMORY_THRESHOLD_MB) {
+          log('warn', `⚠️ Memory still high after GC. Restarting client...`);
+          
+          // Try to save session before restart
+          if (client.authStrategy) {
+            try {
+              log('info', '📥 Saving session before memory-triggered restart');
+              await safelyTriggerSessionSave(client);
+              log('info', '📥 Session saved before memory-triggered restart');
+            } catch (err) {
+              log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+            }
+          }
+          
+          await client.destroy().catch(err => 
+            log('error', `Error destroying client during memory cleanup: ${err.message}`)
+          );
+          client = null;
+          await startClient();
+        }
+      } else {
+        // If GC not available, restart client to reduce memory
+        log('warn', `⚠️ GC not available. Restarting client to reduce memory...`);
+        
+        // Try to save session before restart
+        if (client.authStrategy) {
+          try {
+            log('info', '📥 Saving session before memory-triggered restart');
+            await safelyTriggerSessionSave(client);
+            log('info', '📥 Session saved before memory-triggered restart');
+          } catch (err) {
+            log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+          }
+        }
+        
+        await client.destroy().catch(err => 
+          log('error', `Error destroying client during memory cleanup: ${err.message}`)
+        );
+        client = null;
+        await startClient();
+      }
+    }
+
+    // Additional pupPage check
+    const hasValidPage = Boolean(client.pupPage);
+    if (!hasValidPage) {
+      log('warn', '⚠️ Watchdog: client missing pupPage. Restarting...');
       
       // Try to save session before restart
       if (client.authStrategy) {
         try {
-          log('info', '📥 Saving session before memory-triggered restart');
+          log('info', '📥 Saving session before pupPage-triggered restart');
           await safelyTriggerSessionSave(client);
-          log('info', '📥 Session saved before memory-triggered restart');
+          log('info', '📥 Session saved before pupPage-triggered restart');
         } catch (err) {
-          log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+          log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
         }
       }
       
       await client.destroy().catch(err => 
-        log('error', `Error destroying client during memory cleanup: ${err.message}`)
+        log('error', `Error destroying client in watchdog: ${err.message}`)
+      );
+      client = null;
+      await startClient();
+      return;
+    }
+
+    if (state !== 'CONNECTED') {
+      log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
+      
+      // Try to save session before restart
+      if (client.authStrategy && state !== null) {
+        try {
+          log('info', '📥 Saving session before state-triggered restart');
+          await safelyTriggerSessionSave(client);
+          log('info', '📥 Session saved before state-triggered restart');
+        } catch (err) {
+          log('error', `Failed to save session before state-triggered restart: ${err.message}`);
+        }
+      }
+      
+      await client.destroy().catch(err => 
+        log('error', `Error destroying client in watchdog: ${err.message}`)
       );
       client = null;
       await startClient();
     }
-  } else {
-    // If GC not available, restart client to reduce memory
-    log('warn', `⚠️ GC not available. Restarting client to reduce memory...`);
-    
-    // Try to save session before restart
-    if (client.authStrategy) {
-      try {
-        log('info', '📥 Saving session before memory-triggered restart');
-        await safelyTriggerSessionSave(client);
-        log('info', '📥 Session saved before memory-triggered restart');
-      } catch (err) {
-        log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
-      }
-    }
-    
-    await client.destroy().catch(err => 
-      log('error', `Error destroying client during memory cleanup: ${err.message}`)
-    );
-    client = null;
-    await startClient();
-  }
-}
-
-// Additional pupPage check
-const hasValidPage = Boolean(client.pupPage);
-if (!hasValidPage) {
-  log('warn', '⚠️ Watchdog: client missing pupPage. Restarting...');
-  
-  // Try to save session before restart
-  if (client.authStrategy) {
-    try {
-      log('info', '📥 Saving session before pupPage-triggered restart');
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before pupPage-triggered restart');
-    } catch (err) {
-      log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
-    }
-  }
-  
-  await client.destroy().catch(err => 
-    log('error', `Error destroying client in watchdog: ${err.message}`)
-  );
-  client = null;
-  await startClient();
-  return;
-}
-
-if (state !== 'CONNECTED') {
-  log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
-  
-  // Try to save session before restart
-  if (client.authStrategy && state !== null) {
-    try {
-      log('info', '📥 Saving session before state-triggered restart');
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before state-triggered restart');
-    } catch (err) {
-      log('error', `Failed to save session before state-triggered restart: ${err.message}`);
-    }
-  }
-  
-  await client.destroy().catch(err => 
-    log('error', `Error destroying client in watchdog: ${err.message}`)
-  );
-  client = null;
-  await startClient();
-}
   } catch (err) {
     log('error', `🚨 Watchdog error: ${err.message}. Restarting...`);
     if (client) {
