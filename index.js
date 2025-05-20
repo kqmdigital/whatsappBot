@@ -20,61 +20,56 @@ const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
 const BOT_VERSION = '2.0.0'; // Combined version
 const startedAt = Date.now();
 
-// Initialize a queue for media operations with concurrency limit
-const mediaQueue = new PQueue({ concurrency: 1 });
-
 // Helper function to download media with retries
 async function downloadMedia(url, options = {}) {
-  return mediaQueue.add(async () => {
-    log('info', `🔽 Downloading media from ${url.substring(0, 50)}...`);
-    
-    const defaultOptions = {
-      timeout: 30000,
-      maxRetries: 3,
-      retryDelay: 2000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-        'Accept': 'image/*,*/*'
-      }
-    };
-    
-    const mergedOptions = { ...defaultOptions, ...options };
-    let lastError = null;
-    
-    for (let i = 0; i < mergedOptions.maxRetries; i++) {
-      try {
-        const response = await axios.get(url, {
-          responseType: 'arraybuffer',
-          timeout: mergedOptions.timeout,
-          headers: mergedOptions.headers
-        });
-        
-        const buffer = Buffer.from(response.data);
-        const mimeType = response.headers['content-type'] || 'application/octet-stream';
-        
-        log('info', `✅ Media downloaded successfully: ${buffer.length} bytes, type: ${mimeType}`);
-        
-        // Create MessageMedia object manually
-        return new MessageMedia(
-          mimeType,
-          buffer.toString('base64'),
-          url.split('/').pop() || 'file'
-        );
-      } catch (err) {
-        lastError = err;
-        log('warn', `⚠️ Media download attempt ${i+1}/${mergedOptions.maxRetries} failed: ${err.message}`);
-        
-        if (i < mergedOptions.maxRetries - 1) {
-          // Wait before retry with exponential backoff
-          const delay = mergedOptions.retryDelay * Math.pow(2, i);
-          log('info', `⏱️ Waiting ${delay}ms before retry...`);
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
+  log('info', `🔽 Downloading media from ${url.substring(0, 50)}...`);
+  
+  const defaultOptions = {
+    timeout: 30000,
+    maxRetries: 3,
+    retryDelay: 2000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      'Accept': 'image/*,*/*'
+    }
+  };
+  
+  const mergedOptions = { ...defaultOptions, ...options };
+  let lastError = null;
+  
+  for (let i = 0; i < mergedOptions.maxRetries; i++) {
+    try {
+      const response = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: mergedOptions.timeout,
+        headers: mergedOptions.headers
+      });
+      
+      const buffer = Buffer.from(response.data);
+      const mimeType = response.headers['content-type'] || 'application/octet-stream';
+      
+      log('info', `✅ Media downloaded successfully: ${buffer.length} bytes, type: ${mimeType}`);
+      
+      // Create MessageMedia object manually
+      return new MessageMedia(
+        mimeType,
+        buffer.toString('base64'),
+        url.split('/').pop() || 'file'
+      );
+    } catch (err) {
+      lastError = err;
+      log('warn', `⚠️ Media download attempt ${i+1}/${mergedOptions.maxRetries} failed: ${err.message}`);
+      
+      if (i < mergedOptions.maxRetries - 1) {
+        // Wait before retry with exponential backoff
+        const delay = mergedOptions.retryDelay * Math.pow(2, i);
+        log('info', `⏱️ Waiting ${delay}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
-    
-    throw new Error(`Failed to download media after ${mergedOptions.maxRetries} attempts: ${lastError.message}`);
-  });
+  }
+  
+  throw new Error(`Failed to download media after ${mergedOptions.maxRetries} attempts: ${lastError.message}`);
 }
 
 // Performance settings
