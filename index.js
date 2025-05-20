@@ -112,8 +112,64 @@ function updateSessionState(newState, details = {}) {
   }
 }
 
-Yes, you should replace the entire safelyTriggerSessionSave function with this updated version:
-javascriptasync function safelyTriggerSessionSave(client) {
+// Enhanced function to extract session data from WhatsApp Web
+async function extractSessionData(client) {
+  if (!client || !client.pupPage) {
+    log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
+    return null;
+  }
+  
+  try {
+    // Try multiple approaches to extract session data
+    const sessionData = await client.pupPage.evaluate(() => {
+      // Approach 1: Direct Store access (newer versions)
+      if (window.Store && window.Store.Session && window.Store.Session.getLoginSession) {
+        return window.Store.Session.getLoginSession();
+      }
+      
+      // Approach 2: Local Storage extraction
+      if (window.localStorage) {
+        const keys = Object.keys(window.localStorage).filter(k => 
+          k.includes('WAToken') || k.includes('WASecret') || k.includes('session') || k.includes('WABrowserId')
+        );
+        
+        if (keys.length > 0) {
+          const sessionObj = {};
+          keys.forEach(key => {
+            sessionObj[key] = window.localStorage.getItem(key);
+          });
+          return sessionObj;
+        }
+      }
+      
+      // Approach 3: Legacy approach
+      if (window.Store && window.Store.AppState) {
+        return window.Store.AppState.state;
+      }
+      
+      return null;
+    });
+    
+    if (sessionData) {
+      log('info', '🔍 Successfully extracted session data using browser evaluation');
+      return sessionData;
+    }
+    
+    // Try fallback method by getting authState directly
+    if (client.authStrategy && client.authStrategy.authState) {
+      log('info', '🔍 Using authState from client.authStrategy');
+      return client.authStrategy.authState;
+    }
+    
+    log('warn', '❓ All session data extraction methods failed');
+    return null;
+  } catch (err) {
+    log('error', `Failed to extract session data: ${err.message}`);
+    return null;
+  }
+}
+
+async function safelyTriggerSessionSave(client) {
   if (!client) return false;
   
   try {
@@ -130,24 +186,6 @@ javascriptasync function safelyTriggerSessionSave(client) {
         log('warn', '❓ Could not find valid session data for saving');
         return false;
       }
-    } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
-      // For RemoteAuth fallback
-      await client.authStrategy.requestSave();
-      log('info', '📥 Session save requested');
-      return true;
-    } else {
-      log('info', '📥 Session will be saved automatically (no manual save available)');
-      return false;
-    }
-  } catch (err) {
-    log('error', `Failed to request session save: ${err.message}`);
-    return false;
-  }
-}
-      
-      await client.authStrategy.save(sessionData);
-      log('info', '📥 Session save triggered with valid data');
-      return true;
     } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
       // For RemoteAuth fallback
       await client.authStrategy.requestSave();
@@ -203,15 +241,15 @@ log.debug = (message, ...args) => {
 
 // --- Enhanced LocalAuth with Supabase Integration ---
 class EnhancedLocalAuth extends LocalAuth {
- constructor(options = {}) {
-  super(options);
-  this.supabase = options.supabase;
-  this.sessionId = options.sessionId || 'default';
-  this.retryCount = 0;
-  this.maxRetries = 3;
-  this.client = null; // Add client reference
-  log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
-}
+  constructor(options = {}) {
+    super(options);
+    this.supabase = options.supabase;
+    this.sessionId = options.sessionId || 'default';
+    this.retryCount = 0;
+    this.maxRetries = 3;
+    this.client = null; // Add client reference
+    log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
+  }
 
   async _executeWithRetry(operation, fallback = null) {
     this.retryCount = 0;
@@ -279,75 +317,65 @@ class EnhancedLocalAuth extends LocalAuth {
     }
   }
   
- async save(session) {
-  if (!session) {
-    log('warn', '⚠️ Attempting to save empty session');
-    
-    // Try to get session data using our enhanced extractor
-    const extractedSession = await extractSessionData(this.client);
-    
-    if (extractedSession) {
-      log('info', '🔍 Successfully extracted session data for saving');
-      session = extractedSession;
-    } else {
-      log('warn', '❌ Still no valid session data found, cannot save');
-      return;
-    }
-  }
-      } catch (evalErr) {
-        log('warn', `Failed to extract session from client: ${evalErr.message}`);
+  async save(session) {
+    if (!session) {
+      log('warn', '⚠️ Attempting to save empty session');
+      
+      // Try to get session data using our enhanced extractor
+      const extractedSession = await extractSessionData(this.client);
+      
+      if (extractedSession) {
+        log('info', '🔍 Successfully extracted session data for saving');
+        session = extractedSession;
+      } else {
+        log('warn', '❌ Still no valid session data found, cannot save');
+        return;
       }
     }
     
-    if (!session) {
-      log('warn', '❌ Still no valid session data found, cannot save');
-      return;
-    }
-  }
-  
-  // First save locally using the parent method
-  try {
-    await super.save(session);
-  } catch (err) {
-    log('error', `Failed to save session locally: ${err.message}`);
-    // Continue anyway to try Supabase save
-  }
-  
-  // Then save to Supabase
-  try {
-    const sessionSize = JSON.stringify(session).length;
-    log('info', `Saving session to Supabase (${sessionSize} bytes)`);
-    
-    if (sessionSize < 100) {
-      log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
-      // Save anyway but log the warning
+    // First save locally using the parent method
+    try {
+      await super.save(session);
+    } catch (err) {
+      log('error', `Failed to save session locally: ${err.message}`);
+      // Continue anyway to try Supabase save
     }
     
-    const { error } = await this.supabase
-      .from('whatsapp_sessions')
-      .upsert({
-        session_key: this.sessionId,
-        session_data: session,
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'session_key' });
-    
-    if (error) throw new Error(error.message);
-    log('info', '✅ Session saved to Supabase');
-    
-    // Also create a backup copy
-    await this.supabase
-      .from('whatsapp_sessions')
-      .upsert({
-        session_key: `${this.sessionId}_backup`,
-        session_data: session,
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'session_key' });
-    
-    log('info', '📥 Created session backup');
-  } catch (err) {
-    log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
+    // Then save to Supabase
+    try {
+      const sessionSize = JSON.stringify(session).length;
+      log('info', `Saving session to Supabase (${sessionSize} bytes)`);
+      
+      if (sessionSize < 100) {
+        log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
+        // Save anyway but log the warning
+      }
+      
+      const { error } = await this.supabase
+        .from('whatsapp_sessions')
+        .upsert({
+          session_key: this.sessionId,
+          session_data: session,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'session_key' });
+      
+      if (error) throw new Error(error.message);
+      log('info', '✅ Session saved to Supabase');
+      
+      // Also create a backup copy
+      await this.supabase
+        .from('whatsapp_sessions')
+        .upsert({
+          session_key: `${this.sessionId}_backup`,
+          session_data: session,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'session_key' });
+      
+      log('info', '📥 Created session backup');
+    } catch (err) {
+      log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
+    }
   }
-}
 
   async delete() {
     // Delete from Supabase
@@ -922,63 +950,6 @@ async function checkSessionStatus() {
   }
 }
 
-// Enhanced function to extract session data from WhatsApp Web
-async function extractSessionData(client) {
-  if (!client || !client.pupPage) {
-    log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
-    return null;
-  }
-
-  try {
-    // Try multiple approaches to extract session data
-    const sessionData = await client.pupPage.evaluate(() => {
-      // Approach 1: Direct Store access (newer versions)
-      if (window.Store && window.Store.Session && window.Store.Session.getLoginSession) {
-        return window.Store.Session.getLoginSession();
-      }
-
-      // Approach 2: Local Storage extraction
-      if (window.localStorage) {
-        const keys = Object.keys(window.localStorage).filter(k => 
-          k.includes('WAToken') || k.includes('WASecret') || k.includes('session') || k.includes('WABrowserId')
-        );
-
-        if (keys.length > 0) {
-          const sessionObj = {};
-          keys.forEach(key => {
-            sessionObj[key] = window.localStorage.getItem(key);
-          });
-          return sessionObj;
-        }
-      }
-
-      // Approach 3: Legacy approach
-      if (window.Store && window.Store.AppState) {
-        return window.Store.AppState.state;
-      }
-
-      return null;
-    });
-
-    if (sessionData) {
-      log('info', '🔍 Successfully extracted session data using browser evaluation');
-      return sessionData;
-    }
-
-    // Try fallback method by getting authState directly
-    if (client.authStrategy && client.authStrategy.authState) {
-      log('info', '🔍 Using authState from client.authStrategy');
-      return client.authStrategy.authState;
-    }
-
-    log('warn', '❓ All session data extraction methods failed');
-    return null;
-  } catch (err) {
-    log('error', Failed to extract session data: ${err.message});
-    return null;
-  }
-}
-
 // Improved client starter with mutex to prevent multiple initializations
 async function startClient() {
   if (isClientInitializing) {
@@ -1004,11 +975,12 @@ async function startClient() {
     
     log('info', '🚀 Starting WhatsApp client...');
     client = createWhatsAppClient();
-// Store client reference in auth strategy
-if (client.authStrategy) {
-  client.authStrategy.client = client;
-}
-setupClientEvents(client);
+    
+    // Store client reference in auth strategy
+    if (client.authStrategy) {
+      client.authStrategy.client = client;
+    }
+    setupClientEvents(client);
 
     await client.initialize();
     log('info', '✅ WhatsApp client initialized.');
