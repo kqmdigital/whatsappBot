@@ -2579,3 +2579,14 @@ if (state !== 'CONNECTED') {
   client = null;
   await startClient();
 }
+  } catch (err) {
+    log('error', `🚨 Watchdog error: ${err.message}. Restarting...`);
+    if (client) {
+      await client.destroy().catch(destroyErr => 
+        log('error', `Error destroying client after watchdog error: ${destroyErr.message}`)
+      );
+    }
+    client = null;
+    await startClient();
+  }
+}, WATCHDOG_INTERVAL);
