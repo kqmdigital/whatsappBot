@@ -1591,6 +1591,7 @@ app.post('/send-message', async (req, res) => {
     queuePosition: messageQueue.length,
     queueLength: messageQueue.length,
     taskId,
+    messageId: taskId, // Add messageId field to match what n8n expects
     estimated_send_time: `${(messageQueue.length * 2)} seconds`
   });
 });
@@ -1649,7 +1650,8 @@ app.get('/test-valuation/:jid', async (req, res) => {
     success: true, 
     message: 'Test valuation message added to queue',
     queuePosition: messageQueue.length,
-    taskId
+    taskId,
+    messageId: taskId // Add messageId field to match what n8n expects
   });
 });
 
@@ -1707,7 +1709,8 @@ app.get('/test-interest-rate/:jid', async (req, res) => {
     success: true, 
     message: 'Test interest rate message added to queue',
     queuePosition: messageQueue.length,
-    taskId
+    taskId,
+    messageId: taskId // Add messageId field to match what n8n expects
   });
 });
 
