@@ -2460,3 +2460,33 @@ setInterval(async () => {
     await startClient();
   }
 }, WATCHDOG_INTERVAL);
+
+// Add any additional cleanup or shutdown handlers
+process.on('SIGTERM', async () => {
+  log('info', '📥 Received SIGTERM signal, saving session and shutting down');
+  if (client) {
+    try {
+      await safelyTriggerSessionSave(client);
+      await client.destroy();
+    } catch (err) {
+      log('error', `Error during shutdown: ${err.message}`);
+    }
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  log('info', '📥 Received SIGINT signal, saving session and shutting down');
+  if (client) {
+    try {
+      await safelyTriggerSessionSave(client);
+      await client.destroy();
+    } catch (err) {
+      log('error', `Error during shutdown: ${err.message}`);
+    }
+  }
+  process.exit(0);
+});
+
+// Export app for testing if needed
+module.exports = { app, server, client };
