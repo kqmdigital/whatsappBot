@@ -869,8 +869,7 @@ async function handleIncomingMessage(msg) {
 
     // Check for INTEREST RATE keyword
     const isInterestRateRelated = 
-      text.toLowerCase().includes('dear valued partners') ||
-      (hasReply && replyInfo?.text?.toLowerCase().includes('dear valued partners'));
+      text.toLowerCase().includes('keyquest mortgage team');
 
     // Skip if no keywords match
     if (!isValuationRelated && !isInterestRateRelated) {
