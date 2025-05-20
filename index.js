@@ -118,8 +118,34 @@ async function safelyTriggerSessionSave(client) {
   try {
     // For enhanced LocalAuth, use the save method directly
     if (client.authStrategy && typeof client.authStrategy.save === 'function') {
-      await client.authStrategy.save(client.authStrategy.authState);
-      log('info', '📥 Session save triggered');
+      // Try to get valid session data
+      let sessionData = client.authStrategy.authState;
+      
+      if (!sessionData && client.pupPage) {
+        try {
+          // Try to extract session data directly from browser
+          sessionData = await client.pupPage.evaluate(() => {
+            if (window.Store && window.Store.Session) {
+              return JSON.parse(JSON.stringify(window.Store.Session.getLoginSession()));
+            }
+            return null;
+          }).catch(() => null);
+          
+          if (sessionData) {
+            log('info', '📥 Successfully extracted session data from browser');
+          }
+        } catch (evalErr) {
+          log('warn', `Failed to extract session from browser: ${evalErr.message}`);
+        }
+      }
+      
+      if (!sessionData) {
+        log('warn', '❓ Could not find valid session data for saving');
+        return false;
+      }
+      
+      await client.authStrategy.save(sessionData);
+      log('info', '📥 Session save triggered with valid data');
       return true;
     } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
       // For RemoteAuth fallback
@@ -176,14 +202,15 @@ log.debug = (message, ...args) => {
 
 // --- Enhanced LocalAuth with Supabase Integration ---
 class EnhancedLocalAuth extends LocalAuth {
-  constructor(options = {}) {
-    super(options);
-    this.supabase = options.supabase;
-    this.sessionId = options.sessionId || 'default';
-    this.retryCount = 0;
-    this.maxRetries = 3;
-    log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
-  }
+ constructor(options = {}) {
+  super(options);
+  this.supabase = options.supabase;
+  this.sessionId = options.sessionId || 'default';
+  this.retryCount = 0;
+  this.maxRetries = 3;
+  this.client = null; // Add client reference
+  log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
+}
 
   async _executeWithRetry(operation, fallback = null) {
     this.retryCount = 0;
@@ -251,55 +278,78 @@ class EnhancedLocalAuth extends LocalAuth {
     }
   }
   
-  async save(session) {
+ async save(session) {
+  if (!session) {
+    log('warn', '⚠️ Attempting to save empty session');
+    
+    // Try to get session data from client
+    if (this.client && this.client.pupPage) {
+      try {
+        const extractedSession = await this.client.pupPage.evaluate(() => {
+          if (window.Store && window.Store.Session) {
+            return JSON.parse(JSON.stringify(window.Store.Session.getLoginSession()));
+          }
+          return null;
+        }).catch(() => null);
+        
+        if (extractedSession) {
+          log('info', '🔍 Successfully extracted session data from client');
+          session = extractedSession;
+        }
+      } catch (evalErr) {
+        log('warn', `Failed to extract session from client: ${evalErr.message}`);
+      }
+    }
+    
     if (!session) {
-      log('warn', '⚠️ Attempting to save empty session');
+      log('warn', '❌ Still no valid session data found, cannot save');
       return;
     }
-    
-    // First save locally using the parent method
-    try {
-      await super.save(session);
-    } catch (err) {
-      log('error', `Failed to save session locally: ${err.message}`);
-      // Continue anyway to try Supabase save
-    }
-    
-    // Then save to Supabase
-    try {
-      const sessionSize = JSON.stringify(session).length;
-      log('info', `Saving session to Supabase (${sessionSize} bytes)`);
-      
-      if (sessionSize < 100) {
-        log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
-        // Save anyway but log the warning
-      }
-      
-      const { error } = await this.supabase
-        .from('whatsapp_sessions')
-        .upsert({
-          session_key: this.sessionId,
-          session_data: session,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'session_key' });
-      
-      if (error) throw new Error(error.message);
-      log('info', '✅ Session saved to Supabase');
-      
-      // Also create a backup copy
-      await this.supabase
-        .from('whatsapp_sessions')
-        .upsert({
-          session_key: `${this.sessionId}_backup`,
-          session_data: session,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'session_key' });
-      
-      log('info', '📥 Created session backup');
-    } catch (err) {
-      log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
-    }
   }
+  
+  // First save locally using the parent method
+  try {
+    await super.save(session);
+  } catch (err) {
+    log('error', `Failed to save session locally: ${err.message}`);
+    // Continue anyway to try Supabase save
+  }
+  
+  // Then save to Supabase
+  try {
+    const sessionSize = JSON.stringify(session).length;
+    log('info', `Saving session to Supabase (${sessionSize} bytes)`);
+    
+    if (sessionSize < 100) {
+      log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
+      // Save anyway but log the warning
+    }
+    
+    const { error } = await this.supabase
+      .from('whatsapp_sessions')
+      .upsert({
+        session_key: this.sessionId,
+        session_data: session,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'session_key' });
+    
+    if (error) throw new Error(error.message);
+    log('info', '✅ Session saved to Supabase');
+    
+    // Also create a backup copy
+    await this.supabase
+      .from('whatsapp_sessions')
+      .upsert({
+        session_key: `${this.sessionId}_backup`,
+        session_data: session,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'session_key' });
+    
+    log('info', '📥 Created session backup');
+  } catch (err) {
+    log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
+  }
+}
 
   async delete() {
     // Delete from Supabase
@@ -338,9 +388,15 @@ let lastActivityTime = Date.now();
 // Function to detect if using a business number
 async function detectBusinessAccount(client) {
   try {
+    // Check if business profile function exists
+    if (typeof client.getBusinessProfile !== 'function') {
+      log('info', `Account type detection not supported in this version, assuming regular account`);
+      return false;
+    }
+    
     // Try to access business profile (only available on business accounts)
     const profile = await client.getBusinessProfile();
-    const isBusinessAcct = Boolean(profile && (profile.description || profile.email || profile.websites.length > 0));
+    const isBusinessAcct = Boolean(profile && (profile.description || profile.email || (profile.websites && profile.websites.length > 0)));
     log('info', `Account type: ${isBusinessAcct ? 'Business 💼' : 'Regular 👤'}`);
     return isBusinessAcct;
   } catch (err) {
@@ -893,7 +949,11 @@ async function startClient() {
     
     log('info', '🚀 Starting WhatsApp client...');
     client = createWhatsAppClient();
-    setupClientEvents(client);
+// Store client reference in auth strategy
+if (client.authStrategy) {
+  client.authStrategy.client = client;
+}
+setupClientEvents(client);
 
     await client.initialize();
     log('info', '✅ WhatsApp client initialized.');
