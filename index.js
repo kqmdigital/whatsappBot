@@ -112,37 +112,38 @@ function updateSessionState(newState, details = {}) {
   }
 }
 
-async function safelyTriggerSessionSave(client) {
+Yes, you should replace the entire safelyTriggerSessionSave function with this updated version:
+javascriptasync function safelyTriggerSessionSave(client) {
   if (!client) return false;
   
   try {
     // For enhanced LocalAuth, use the save method directly
     if (client.authStrategy && typeof client.authStrategy.save === 'function') {
-      // Try to get valid session data
-      let sessionData = client.authStrategy.authState;
+      // Try to get session data using our enhanced extractor
+      const sessionData = await extractSessionData(client);
       
-      if (!sessionData && client.pupPage) {
-        try {
-          // Try to extract session data directly from browser
-          sessionData = await client.pupPage.evaluate(() => {
-            if (window.Store && window.Store.Session) {
-              return JSON.parse(JSON.stringify(window.Store.Session.getLoginSession()));
-            }
-            return null;
-          }).catch(() => null);
-          
-          if (sessionData) {
-            log('info', '📥 Successfully extracted session data from browser');
-          }
-        } catch (evalErr) {
-          log('warn', `Failed to extract session from browser: ${evalErr.message}`);
-        }
-      }
-      
-      if (!sessionData) {
+      if (sessionData) {
+        await client.authStrategy.save(sessionData);
+        log('info', '📥 Session save triggered with valid data');
+        return true;
+      } else {
         log('warn', '❓ Could not find valid session data for saving');
         return false;
       }
+    } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
+      // For RemoteAuth fallback
+      await client.authStrategy.requestSave();
+      log('info', '📥 Session save requested');
+      return true;
+    } else {
+      log('info', '📥 Session will be saved automatically (no manual save available)');
+      return false;
+    }
+  } catch (err) {
+    log('error', `Failed to request session save: ${err.message}`);
+    return false;
+  }
+}
       
       await client.authStrategy.save(sessionData);
       log('info', '📥 Session save triggered with valid data');
@@ -282,20 +283,17 @@ class EnhancedLocalAuth extends LocalAuth {
   if (!session) {
     log('warn', '⚠️ Attempting to save empty session');
     
-    // Try to get session data from client
-    if (this.client && this.client.pupPage) {
-      try {
-        const extractedSession = await this.client.pupPage.evaluate(() => {
-          if (window.Store && window.Store.Session) {
-            return JSON.parse(JSON.stringify(window.Store.Session.getLoginSession()));
-          }
-          return null;
-        }).catch(() => null);
-        
-        if (extractedSession) {
-          log('info', '🔍 Successfully extracted session data from client');
-          session = extractedSession;
-        }
+    // Try to get session data using our enhanced extractor
+    const extractedSession = await extractSessionData(this.client);
+    
+    if (extractedSession) {
+      log('info', '🔍 Successfully extracted session data for saving');
+      session = extractedSession;
+    } else {
+      log('warn', '❌ Still no valid session data found, cannot save');
+      return;
+    }
+  }
       } catch (evalErr) {
         log('warn', `Failed to extract session from client: ${evalErr.message}`);
       }
@@ -924,6 +922,63 @@ async function checkSessionStatus() {
   }
 }
 
+// Enhanced function to extract session data from WhatsApp Web
+async function extractSessionData(client) {
+  if (!client || !client.pupPage) {
+    log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
+    return null;
+  }
+
+  try {
+    // Try multiple approaches to extract session data
+    const sessionData = await client.pupPage.evaluate(() => {
+      // Approach 1: Direct Store access (newer versions)
+      if (window.Store && window.Store.Session && window.Store.Session.getLoginSession) {
+        return window.Store.Session.getLoginSession();
+      }
+
+      // Approach 2: Local Storage extraction
+      if (window.localStorage) {
+        const keys = Object.keys(window.localStorage).filter(k => 
+          k.includes('WAToken') || k.includes('WASecret') || k.includes('session') || k.includes('WABrowserId')
+        );
+
+        if (keys.length > 0) {
+          const sessionObj = {};
+          keys.forEach(key => {
+            sessionObj[key] = window.localStorage.getItem(key);
+          });
+          return sessionObj;
+        }
+      }
+
+      // Approach 3: Legacy approach
+      if (window.Store && window.Store.AppState) {
+        return window.Store.AppState.state;
+      }
+
+      return null;
+    });
+
+    if (sessionData) {
+      log('info', '🔍 Successfully extracted session data using browser evaluation');
+      return sessionData;
+    }
+
+    // Try fallback method by getting authState directly
+    if (client.authStrategy && client.authStrategy.authState) {
+      log('info', '🔍 Using authState from client.authStrategy');
+      return client.authStrategy.authState;
+    }
+
+    log('warn', '❓ All session data extraction methods failed');
+    return null;
+  } catch (err) {
+    log('error', Failed to extract session data: ${err.message});
+    return null;
+  }
+}
+
 // Improved client starter with mutex to prevent multiple initializations
 async function startClient() {
   if (isClientInitializing) {
@@ -1342,10 +1397,21 @@ setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
 
 // Enhanced message sending endpoint with queue
 app.post('/send-message', async (req, res) => {
-  const { jid, message, imageUrl, options = {} } = req.body;
+  // Accept either jid or groupId parameter
+  const jid = req.body.jid || req.body.groupId;
+  const { message, imageUrl, options = {} } = req.body;
 
   if (!jid || (!message && !imageUrl)) {
-    return res.status(400).json({ success: false, error: 'Missing jid or message/imageUrl' });
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing jid/groupId or message/imageUrl',
+      received: {
+        jid: req.body.jid,
+        groupId: req.body.groupId,
+        hasMessage: Boolean(message),
+        hasImageUrl: Boolean(imageUrl)
+      }
+    });
   }
 
   if (!client) {
