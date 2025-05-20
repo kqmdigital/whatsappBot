@@ -836,7 +836,7 @@ async function handleIncomingMessage(msg) {
     }
     
     // Only process group messages
-    if (!msg.from.endsWith('@g.us')) {
+    if (!msg.from.endsWith('@g.us') && !msg.from.endsWith('@c.us')) {
       return;
     }
 
@@ -871,11 +871,16 @@ async function handleIncomingMessage(msg) {
     const isInterestRateRelated = 
       text.toLowerCase().includes('keyquest mortgage team');
 
-    // Skip if no keywords match
-    if (!isValuationRelated && !isInterestRateRelated) {
-      log('info', '🚫 Ignored message (no relevant keywords).');
-      return;
-    }
+    // ADD THIS: Check for GROUP CREATION keyword
+const isGroupCreationRequest = 
+  text.toLowerCase().includes('create group:') ||
+  text.toLowerCase().includes('new group:');
+
+// Skip if no keywords match - modify this line to include group creation
+if (!isValuationRelated && !isInterestRateRelated && !isGroupCreationRequest) {
+  log('info', '🚫 Ignored message (no relevant keywords).');
+  return;
+}
 
     // Update activity time when processing messages
     lastActivityTime = Date.now();
@@ -928,11 +933,170 @@ async function handleIncomingMessage(msg) {
       await sendToN8nWebhook(INTEREST_RATE_WEBHOOK_URL, payload, 'INTEREST_RATE');
     }
     
-  } catch (err) {
-    log('error', `Error processing message: ${err.message}`);
+ // ADD THIS: Handle group creation requests
+if (isGroupCreationRequest) {
+  log('info', '👥 Detected group creation request');
+  const groupDetails = parseGroupCreationRequest(text);
+  if (groupDetails) {
+    await handleGroupCreation(msg, groupDetails);
+  } else {
+    // Send help message if parsing failed
+    try {
+      await client.sendMessage(msg.from, 
+        '⚠️ Invalid group creation format. Please use:\n\n' +
+        'create group: Group Name | participant1, participant2, ...'
+      );
+    } catch (err) {
+      log('error', `Failed to send help message: ${err.message}`);
+    }
   }
 }
 
+   /**
+ * Parse a group creation request message
+ * Expected format: "create group: Group Name | participant1, participant2, ..."
+ */
+function parseGroupCreationRequest(text) {
+  try {
+    // Find the starting index after the keyword
+    let startIndex = -1;
+    if (text.toLowerCase().includes('create group:')) {
+      startIndex = text.toLowerCase().indexOf('create group:') + 'create group:'.length;
+    } else if (text.toLowerCase().includes('new group:')) {
+      startIndex = text.toLowerCase().indexOf('new group:') + 'new group:'.length;
+    }
+    
+    if (startIndex === -1) return null;
+    
+    // Extract the relevant part of the text
+    const relevantText = text.substring(startIndex).trim();
+    
+    // Split by pipe to separate group name and participants
+    const parts = relevantText.split('|');
+    
+    if (parts.length < 2) {
+      return {
+        groupName: parts[0].trim(),
+        participants: []
+      };
+    }
+    
+    const groupName = parts[0].trim();
+    const participantsText = parts[1].trim();
+    
+    // Split participants by comma
+    const participants = participantsText
+      .split(',')
+      .map(p => p.trim())
+      .filter(p => p.length > 0);
+    
+    return {
+      groupName,
+      participants
+    };
+  } catch (err) {
+    log('error', `Failed to parse group creation request: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Handle group creation using WhatsApp Web.js
+ */
+async function handleGroupCreation(msg, groupDetails) {
+  if (!client) {
+    log('error', '❌ Cannot create group: WhatsApp client not ready');
+    try {
+      await client.sendMessage(msg.from, '❌ Cannot create group: WhatsApp service not ready. Please try again later.');
+    } catch (err) {
+      log('error', `Failed to send error message: ${err.message}`);
+    }
+    return;
+  }
+  
+  if (!groupDetails || !groupDetails.groupName) {
+    log('error', '❌ Cannot create group: Missing group name');
+    try {
+      await client.sendMessage(msg.from, '❌ Please provide a group name.');
+    } catch (err) {
+      log('error', `Failed to send error message: ${err.message}`);
+    }
+    return;
+  }
+  
+  const { groupName, participants } = groupDetails;
+  
+  // Make sure we have at least one participant
+  if (!participants || participants.length === 0) {
+    log('error', '❌ Cannot create group: No participants specified');
+    try {
+      await client.sendMessage(msg.from, '❌ Please provide at least one participant in the format: participant1, participant2, ...');
+    } catch (err) {
+      log('error', `Failed to send error message: ${err.message}`);
+    }
+    return;
+  }
+  
+  try {
+    log('info', `👥 Creating group "${groupName}" with ${participants.length} participants`);
+    
+    // Send acknowledgment that we're working on it
+    await client.sendMessage(msg.from, `⏳ Creating group "${groupName}" with ${participants.length} participants. Please wait...`);
+    
+    // Format participants as phone numbers with proper formatting
+    const formattedParticipants = participants.map(p => {
+      // Remove any non-numeric characters except + sign
+      let cleaned = p.replace(/[^\d+]/g, '');
+      
+      // If it doesn't have country code or +, add default country code
+      // (You may want to customize this based on your region)
+      if (!cleaned.startsWith('1') && !cleaned.startsWith('+')) {
+        cleaned = '65' + cleaned; // Using Singapore country code as default
+      }
+      
+      // Make sure it has @ notation for WhatsApp
+      if (!cleaned.includes('@c.us')) {
+        cleaned = cleaned + '@c.us';
+      }
+      
+      return cleaned;
+    });
+    
+    log('info', `Formatted participants: ${JSON.stringify(formattedParticipants)}`);
+    
+    // Create the group using WhatsApp Web.js API
+    const result = await client.createGroup(groupName, formattedParticipants);
+    
+    if (result && result.gid) {
+      log('info', `✅ Group created successfully: ${result.gid}`);
+      
+      // Send confirmation message to the original sender
+      await client.sendMessage(msg.from, `✅ Group "${groupName}" created successfully with ${participants.length} participants.`);
+      
+      // Send welcome message to the new group
+      setTimeout(async () => {
+        try {
+          await client.sendMessage(result.gid, `Welcome to the "${groupName}" group! This group was created using the WhatsApp bot.`);
+        } catch (err) {
+          log('warn', `Could not send welcome message to new group: ${err.message}`);
+        }
+      }, 3000); // Small delay to ensure group is fully created
+    } else {
+      log('error', '❌ Failed to create group: Unknown error');
+      await client.sendMessage(msg.from, `❌ Failed to create group "${groupName}". Please try again later.`);
+    }
+  } catch (err) {
+    log('error', `❌ Error creating group: ${err.message}`);
+    
+    // Send error message back to the original sender
+    try {
+      await client.sendMessage(msg.from, `❌ Failed to create group "${groupName}": ${err.message}`);
+    } catch (sendErr) {
+      log('error', `Failed to send error message: ${sendErr.message}`);
+    }
+  }
+} 
+    
 // Improved webhook sender with webhook type parameter
 async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
   if (!webhookUrl) {
@@ -1887,6 +2051,10 @@ app.get('/webhooks', (req, res) => {
     interestRate: {
       configured: Boolean(INTEREST_RATE_WEBHOOK_URL),
       url: INTEREST_RATE_WEBHOOK_URL ? '[configured]' : null,
+    },
+    groupCreation: {
+      configured: true,
+      description: "Available directly via 'create group:' message"
     }
   });
 });
@@ -1962,6 +2130,139 @@ app.get('/ping', (_, res) => {
   res.status(200).send('pong');
 });
 
+// Create group API endpoint
+app.post('/create-group', async (req, res) => {
+  const { groupName, participants } = req.body;
+  
+  if (!client) {
+    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
+  }
+  
+  if (!groupName) {
+    return res.status(400).json({ success: false, error: 'Missing groupName parameter' });
+  }
+  
+  if (!participants || !Array.isArray(participants) || participants.length === 0) {
+    return res.status(400).json({ success: false, error: 'participants must be a non-empty array of phone numbers' });
+  }
+  
+  try {
+    log('info', `👥 API request to create group "${groupName}" with ${participants.length} participants`);
+    
+    // Format participants as WhatsApp expects
+    const formattedParticipants = participants.map(p => {
+      // Remove any non-numeric characters except + sign
+      let cleaned = p.replace(/[^\d+]/g, '');
+      
+      // Add country code if missing
+      if (!cleaned.startsWith('1') && !cleaned.startsWith('+')) {
+        cleaned = '65' + cleaned; // Using Singapore country code as default
+      }
+      
+      // Add @c.us if missing
+      if (!cleaned.includes('@c.us')) {
+        cleaned = cleaned + '@c.us';
+      }
+      
+      return cleaned;
+    });
+    
+    log('info', `Formatted participants: ${JSON.stringify(formattedParticipants)}`);
+    
+    // Create the group
+    const result = await client.createGroup(groupName, formattedParticipants);
+    
+    if (result && result.gid) {
+      log('info', `✅ Group created successfully via API: ${result.gid}`);
+      
+      // Send welcome message to the group
+      setTimeout(async () => {
+        try {
+          await client.sendMessage(result.gid, `Welcome to the "${groupName}" group! This group was created via the API.`);
+        } catch (err) {
+          log('warn', `Could not send welcome message to new group: ${err.message}`);
+        }
+      }, 3000); // Small delay to ensure group is fully created
+      
+      return res.status(201).json({ 
+        success: true, 
+        groupId: result.gid,
+        groupName,
+        participantCount: formattedParticipants.length
+      });
+    } else {
+      log('error', '❌ Failed to create group via API: Unknown error');
+      return res.status(500).json({ 
+        success: false, 
+        error: 'Unknown error during group creation'
+      });
+    }
+  } catch (err) {
+    log('error', `❌ Error creating group via API: ${err.message}`);
+    return res.status(500).json({ 
+      success: false, 
+      error: err.message
+    });
+  }
+});
+
+// Test endpoint for message that would trigger group creation
+app.post('/test-group-creation-message', async (req, res) => {
+  const { phoneNumber, message } = req.body;
+  
+  if (!client) {
+    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
+  }
+  
+  if (!phoneNumber) {
+    return res.status(400).json({ success: false, error: 'Missing phoneNumber parameter' });
+  }
+  
+  if (!message || !message.includes('create group:')) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Message must include "create group:" followed by group details' 
+    });
+  }
+  
+  try {
+    // Format phone number
+    let formattedPhone = phoneNumber.replace(/[^\d+]/g, '');
+    if (!formattedPhone.includes('@c.us')) {
+      formattedPhone = formattedPhone + '@c.us';
+    }
+    
+    log('info', `🧪 Sending test group creation message to ${formattedPhone}`);
+    
+    // Parse the group details from the message
+    const groupDetails = parseGroupCreationRequest(message);
+    
+    if (!groupDetails) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Could not parse group creation details from message' 
+      });
+    }
+    
+    // Instead of actually creating the group, just send what would be created
+    await client.sendMessage(formattedPhone, 
+      `✅ Test: Would create group "${groupDetails.groupName}" with participants: ${groupDetails.participants.join(', ')}`
+    );
+    
+    return res.status(200).json({
+      success: true,
+      message: 'Test message sent successfully',
+      parsedDetails: groupDetails
+    });
+  } catch (err) {
+    log('error', `❌ Error sending test message: ${err.message}`);
+    return res.status(500).json({ 
+      success: false, 
+      error: err.message
+    });
+  }
+});
+    
 // Start server and initialize client
 const server = app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
