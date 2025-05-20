@@ -10,6 +10,8 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 // Supabase configuration
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const VALUATION_WEBHOOK_URL = process.env.VALUATION_WEBHOOK_URL;
+const INTEREST_RATE_WEBHOOK_URL = process.env.INTEREST_RATE_WEBHOOK_URL;
 
 // Add retry package for better network request handling
 const { default: PQueue } = require('p-queue');
