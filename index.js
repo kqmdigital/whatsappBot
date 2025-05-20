@@ -1530,11 +1530,11 @@ async function processMessageQueue() {
     
     log('info', `✉️ Message sent from queue (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR} this hour, ${messageQueue.length} remaining)`);
     
-    callback({ 
-      success: true, 
-      messageId: sentMessage.id.id,
-      timestamp: new Date().toISOString()
-    });
+     callback({ 
+  success: true, 
+  messageId: sentMessage.id._serialized, // Use _serialized format which is the actual WhatsApp ID
+  timestamp: new Date().toISOString()
+});
   } catch (err) {
     log('error', `Error processing message from queue: ${err.message}`);
     if (messageQueue.length > 0) {
@@ -1825,14 +1825,13 @@ app.post('/send-message', async (req, res) => {
   
   // Respond immediately with task info
   return res.status(202).json({
-    success: true,
-    message: 'Message added to queue',
-    queuePosition: messageQueue.length,
-    queueLength: messageQueue.length,
-    taskId,
-    messageId: taskId, // Add messageId field to match what n8n expects
-    estimated_send_time: `${(messageQueue.length * 2)} seconds`
-  });
+  success: true,
+  message: 'Message added to queue',
+  queuePosition: messageQueue.length,
+  queueLength: messageQueue.length,
+  // Remove the messageId field altogether since we don't have the real ID yet
+  // The actual WhatsApp messageId will only be available after the message is sent
+  estimated_send_time: `${(messageQueue.length * 2)} seconds`
 });
 
 // Test valuation message endpoint 
@@ -1865,7 +1864,7 @@ app.get('/test-valuation/:jid', async (req, res) => {
           groupId: jid,
           senderId: 'test_system',
           text: 'valuation test message',
-          messageId: result.messageId || 'test_id',
+           messageId: msg.id._serialized || '',
           hasReply: false,
           timestamp: new Date().toISOString(),
           botVersion: BOT_VERSION,
@@ -1924,7 +1923,7 @@ app.get('/test-interest-rate/:jid', async (req, res) => {
           groupId: jid,
           senderId: 'test_system',
           text: 'dear valued partners test message',
-          messageId: result.messageId || 'test_id',
+          messageId: msg.id._serialized || '',
           hasReply: false,
           timestamp: new Date().toISOString(),
           botVersion: BOT_VERSION,
