@@ -1,7 +1,6 @@
 // At the top with other imports
 const fs = require('fs');
 const path = require('path');
-const qrcode = require('qrcode-terminal');
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
@@ -19,7 +18,7 @@ const { default: PQueue } = require('p-queue');
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '2.0.0'; // Combined version
+const BOT_VERSION = '2.0.0';
 const startedAt = Date.now();
 
 // Enhanced logging with levels
@@ -835,7 +834,7 @@ async function handleIncomingMessage(msg) {
       return;
     }
     
-    // Only process group messages and direct messages for group creation
+    // Only process group messages and direct messages
     if (!msg.from.endsWith('@g.us') && !msg.from.endsWith('@c.us')) {
       return;
     }
@@ -843,7 +842,7 @@ async function handleIncomingMessage(msg) {
     const chatId = msg.from;
     const senderId = msg.author || msg.from;
     const text = msg.body || '';
-    const messageId = msg?.id?.id?.toString?.() || '';
+    const messageId = msg.id._serialized || '';
 
     let replyInfo = null;
     let hasReply = false;
@@ -851,10 +850,10 @@ async function handleIncomingMessage(msg) {
     // Get quoted message if this is a reply
     try {
       const quoted = await msg.getQuotedMessage?.();
-      if (quoted?.id?.id) {
+      if (quoted?.id?._serialized) {
         hasReply = true;
         replyInfo = {
-          message_id: quoted?.id?.id || null,
+          message_id: quoted.id._serialized || null,
           text: quoted?.body || null,
         };
       }
@@ -871,13 +870,8 @@ async function handleIncomingMessage(msg) {
     const isInterestRateRelated = 
       text.toLowerCase().includes('keyquest mortgage team');
 
-    // Check for GROUP CREATION keyword
-    const isGroupCreationRequest = 
-      text.toLowerCase().includes('create group:') ||
-      text.toLowerCase().includes('new group:');
-
     // Skip if no keywords match
-    if (!isValuationRelated && !isInterestRateRelated && !isGroupCreationRequest) {
+    if (!isValuationRelated && !isInterestRateRelated) {
       log('info', '🚫 Ignored message (no relevant keywords).');
       return;
     }
@@ -932,247 +926,11 @@ async function handleIncomingMessage(msg) {
       log('info', '💰 Detected interest rate related message');
       await sendToN8nWebhook(INTEREST_RATE_WEBHOOK_URL, payload, 'INTEREST_RATE');
     }
-    
-    // Handle group creation
-    if (isGroupCreationRequest) {
-      log('info', '👥 Detected group creation request');
-      const groupDetails = parseGroupCreationRequest(text);
-      if (groupDetails) {
-        await handleGroupCreation(msg, groupDetails);
-      } else {
-        // Send help message if parsing failed
-        try {
-          await client.sendMessage(msg.from, 
-            '⚠️ Invalid group creation format. Please use:\n\n' +
-            'create group: Group Name | participant1, participant2, ...'
-          );
-        } catch (err) {
-          log('error', `Failed to send help message: ${err.message}`);
-        }
-      }
-    }
-    
   } catch (err) {
     log('error', `Error processing message: ${err.message}`);
   }
 }
 
-/**
- * Parse a group creation request message
- * Expected format: "create group: Group Name | participant1, participant2, ..."
- */
-function parseGroupCreationRequest(text) {
-  try {
-    // Find the starting index after the keyword
-    let startIndex = -1;
-    if (text.toLowerCase().includes('create group:')) {
-      startIndex = text.toLowerCase().indexOf('create group:') + 'create group:'.length;
-    } else if (text.toLowerCase().includes('new group:')) {
-      startIndex = text.toLowerCase().indexOf('new group:') + 'new group:'.length;
-    }
-    
-    if (startIndex === -1) return null;
-    
-    // Extract the relevant part of the text
-    const relevantText = text.substring(startIndex).trim();
-    
-    // Split by pipe to separate group name and participants
-    const parts = relevantText.split('|');
-    
-    if (parts.length < 2) {
-      return {
-        groupName: parts[0].trim(),
-        participants: []
-      };
-    }
-    
-    const groupName = parts[0].trim();
-    const participantsText = parts[1].trim();
-    
-    // Split participants by comma
-    const participants = participantsText
-      .split(',')
-      .map(p => p.trim())
-      .filter(p => p.length > 0);
-    
-    return {
-      groupName,
-      participants
-    };
-  } catch (err) {
-    log('error', `Failed to parse group creation request: ${err.message}`);
-    return null;
-  }
-}
-
-/**
- * Handle group creation using WhatsApp Web.js
- */
-async function handleGroupCreation(msg, groupDetails) {
-  if (!client) {
-    log('error', '❌ Cannot create group: WhatsApp client not ready');
-    try {
-      await client.sendMessage(msg.from, '❌ Cannot create group: WhatsApp service not ready. Please try again later.');
-    } catch (err) {
-      log('error', `Failed to send error message: ${err.message}`);
-    }
-    return;
-  }
-  
-  if (!groupDetails || !groupDetails.groupName) {
-    log('error', '❌ Cannot create group: Missing group name');
-    try {
-      await client.sendMessage(msg.from, '❌ Please provide a group name.');
-    } catch (err) {
-      log('error', `Failed to send error message: ${err.message}`);
-    }
-    return;
-  }
-  
-  const { groupName, participants } = groupDetails;
-  
-  // Make sure we have at least one participant
-  if (!participants || participants.length === 0) {
-    log('error', '❌ Cannot create group: No participants specified');
-    try {
-      await client.sendMessage(msg.from, '❌ Please provide at least one participant in the format: participant1, participant2, ...');
-    } catch (err) {
-      log('error', `Failed to send error message: ${err.message}`);
-    }
-    return;
-  }
-  
-  try {
-    log('info', `👥 Creating group "${groupName}" with ${participants.length} participants`);
-    
-    // Send acknowledgment that we're working on it
-    await client.sendMessage(msg.from, `⏳ Creating group "${groupName}" with ${participants.length} participants. Please wait...`);
-    
-   // Format participants as phone numbers with proper formatting
-const formattedParticipants = participants.map(p => {
-  // Remove any non-numeric characters except + sign
-  let cleaned = p.replace(/[^\d+]/g, '');
-  
-  // Check if the number already has the Singapore country code (65)
-  const alreadyHasCountryCode = cleaned.startsWith('65') || cleaned.startsWith('+65');
-  
-  // Only add country code if it doesn't have one already
-  if (!alreadyHasCountryCode && !cleaned.startsWith('1') && !cleaned.startsWith('+')) {
-    cleaned = '65' + cleaned; // Using Singapore country code as default
-  }
-  
-  // Make sure it has @ notation for WhatsApp
-  if (!cleaned.includes('@c.us')) {
-    cleaned = cleaned + '@c.us';
-  }
-  
-  return cleaned;
-});
-    
-    log('info', `Formatted participants: ${JSON.stringify(formattedParticipants)}`);
-    
-    // First, create the group with just one participant (or no participants if allowed)
-    // We'll add the other participants later
-    const firstParticipant = formattedParticipants.length > 0 ? [formattedParticipants[0]] : [];
-    const result = await client.createGroup(groupName, firstParticipant);
-    
-    if (result && result.gid) {
-      // Properly handle group ID format
-      const groupId = typeof result.gid === 'object' 
-        ? (result.gid._serialized || result.gid.toString()) 
-        : result.gid;
-      
-      log('info', `✅ Group created with ID: ${groupId}`);
-      
-      // Add the rest of the participants (if any)
-      // But we need to wait for the group to be fully created first
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      
-      let addedCount = firstParticipant.length;
-      
-      try {
-        if (formattedParticipants.length > firstParticipant.length) {
-          // Get the remaining participants
-          const remainingParticipants = formattedParticipants.slice(firstParticipant.length);
-          
-          // Get the GroupChat object so we can use addParticipants
-          const chat = await client.getChatById(groupId);
-          
-          if (chat.isGroup) {
-            log('info', `👥 Adding ${remainingParticipants.length} more participants to group...`);
-            
-            try {
-              // This is the key line - using the addParticipants method from the GroupChat class
-              const result = await chat.addParticipants(remainingParticipants, {
-                sleep: [1000, 2000], // Add delay between adding participants
-                autoSendInviteV4: true, // Send invites to participants who restricted being added
-                comment: `You've been added to ${groupName}` // Comment for the invite
-              });
-              
-              log('info', `✅ Add participants result: ${JSON.stringify(result)}`);
-              
-              // Check for successful additions
-              if (typeof result === 'object') {
-                for (const [participantId, addResult] of Object.entries(result)) {
-                  if (addResult.code === 200) {
-                    addedCount++;
-                    log('info', `✅ Successfully added ${participantId}`);
-                  } else {
-                    log('warn', `⚠️ Failed to add ${participantId}: ${addResult.message}`);
-                  }
-                }
-              }
-            } catch (addErr) {
-              log('warn', `⚠️ Error adding participants: ${addErr.message}`);
-            }
-          } else {
-            log('warn', '⚠️ Retrieved chat is not a group chat');
-          }
-        }
-      } catch (chatErr) {
-        log('warn', `⚠️ Error retrieving group chat: ${chatErr.message}`);
-      }
-      
-      // Send confirmation message
-      await client.sendMessage(msg.from, 
-        `✅ Group "${groupName}" created successfully with ${addedCount}/${formattedParticipants.length} participants added. Some participants may need to accept invitations.`);
-      
-      // Send welcome message to the new group
-      setTimeout(async () => {
-        try {
-          await client.sendMessage(groupId, 
-            `Welcome to the "${groupName}" group! This group was created using the WhatsApp bot.`);
-          log('info', '✅ Sent welcome message to the new group');
-        } catch (err) {
-          log('warn', `Could not send welcome message to new group: ${err.message}`);
-          
-          // Try again with a longer delay
-          setTimeout(async () => {
-            try {
-              await client.sendMessage(groupId, 
-                `Welcome to the "${groupName}" group! This group was created using the WhatsApp bot.`);
-              log('info', '✅ Sent welcome message to the new group after retry');
-            } catch (retryErr) {
-              log('error', `Failed to send welcome message after retry: ${retryErr.message}`);
-            }
-          }, 10000);
-        }
-      }, 5000);
-    } else {
-      log('error', '❌ Failed to create group: Unknown error');
-      await client.sendMessage(msg.from, `❌ Failed to create group "${groupName}". Please try again later.`);
-    }
-  } catch (err) {
-    log('error', `❌ Error creating group: ${err.message}`);
-    
-    // Send error message back to the original sender
-    try {
-      await client.sendMessage(msg.from, `❌ Failed to create group "${groupName}": ${err.message}`);
-    } catch (sendErr) {
-      log('error', `Failed to send error message: ${sendErr.message}`);
-    }
-  }
-}
 // Improved webhook sender with webhook type parameter
 async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
   if (!webhookUrl) {
@@ -1530,11 +1288,11 @@ async function processMessageQueue() {
     
     log('info', `✉️ Message sent from queue (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR} this hour, ${messageQueue.length} remaining)`);
     
-     callback({ 
-  success: true, 
-  messageId: sentMessage.id._serialized, // Use _serialized format which is the actual WhatsApp ID
-  timestamp: new Date().toISOString()
-});
+    callback({ 
+      success: true, 
+      messageId: sentMessage.id._serialized,
+      timestamp: new Date().toISOString()
+    });
   } catch (err) {
     log('error', `Error processing message from queue: ${err.message}`);
     if (messageQueue.length > 0) {
@@ -1800,7 +1558,7 @@ app.post('/send-message', async (req, res) => {
   }
   
   // Add message to queue
-  const taskId = `task_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+  const id = `${Date.now()}_${Math.floor(Math.random() * 1000)}`;
   
   log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length + 1})`);
   
@@ -1810,11 +1568,10 @@ app.post('/send-message', async (req, res) => {
     message,
     imageUrl,
     options,
-    taskId,
     addedAt: Date.now(),
     callback: (result) => {
       // This will be called when the message is actually sent
-      log('info', `Task ${taskId} completed with result: ${result.success ? 'success' : 'failure'}`);
+      log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
     }
   });
   
@@ -1823,267 +1580,14 @@ app.post('/send-message', async (req, res) => {
     processMessageQueue();
   }
   
-  // Respond immediately with task info
+  // Respond immediately
   return res.status(202).json({
-  success: true,
-  message: 'Message added to queue',
-  queuePosition: messageQueue.length,
-  queueLength: messageQueue.length,
-  // Remove the messageId field altogether since we don't have the real ID yet
-  // The actual WhatsApp messageId will only be available after the message is sent
-  estimated_send_time: `${(messageQueue.length * 2)} seconds`
-});
-
-// Test valuation message endpoint 
-app.get('/test-valuation/:jid', async (req, res) => {
-  const jid = req.params.jid;
-  
-  if (!client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
-  }
-  
-  if (!VALUATION_WEBHOOK_URL) {
-    return res.status(404).json({ success: false, error: 'Valuation webhook URL not configured' });
-  }
-  
-  // Add test message to queue
-  const taskId = `test_valuation_${Date.now()}`;
-  
-  messageQueue.push({
-    jid,
-    message: 'This is a test valuation message from the WhatsApp bot',
-    options: {},
-    taskId,
-    addedAt: Date.now(),
-    callback: (result) => {
-      log('info', `Test valuation message to ${jid} ${result.success ? 'sent' : 'failed'}`);
-      
-      // If message sent successfully, also notify the webhook for testing
-      if (result.success) {
-        const testPayload = {
-          groupId: jid,
-          senderId: 'test_system',
-          text: 'valuation test message',
-           messageId: msg.id._serialized || '',
-          hasReply: false,
-          timestamp: new Date().toISOString(),
-          botVersion: BOT_VERSION,
-          isTestMessage: true
-        };
-        
-        sendToN8nWebhook(VALUATION_WEBHOOK_URL, testPayload, 'VALUATION');
-      }
-    }
-  });
-  
-  // Start processing if not already running
-  if (!isProcessingQueue) {
-    processMessageQueue();
-  }
-  
-  log('info', `Test valuation message queued for ${jid}`);
-  
-  // Respond immediately
-  return res.status(202).json({ 
-    success: true, 
-    message: 'Test valuation message added to queue',
+    success: true,
+    message: 'Message added to queue',
     queuePosition: messageQueue.length,
-    taskId,
-    messageId: taskId // Add messageId field to match what n8n expects
+    queueLength: messageQueue.length,
+    estimated_send_time: `${(messageQueue.length * 2)} seconds`
   });
-});
-
-// Test interest rate message endpoint
-app.get('/test-interest-rate/:jid', async (req, res) => {
-  const jid = req.params.jid;
-  
-  if (!client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
-  }
-  
-  if (!INTEREST_RATE_WEBHOOK_URL) {
-    return res.status(404).json({ success: false, error: 'Interest rate webhook URL not configured' });
-  }
-  
-  // Add test message to queue
-  const taskId = `test_interest_${Date.now()}`;
-  
-  messageQueue.push({
-    jid,
-    message: 'This is a test message: dear valued partners, from the WhatsApp bot',
-    options: {},
-    taskId,
-    addedAt: Date.now(),
-    callback: (result) => {
-      log('info', `Test interest rate message to ${jid} ${result.success ? 'sent' : 'failed'}`);
-      
-      // If message sent successfully, also notify the webhook for testing
-      if (result.success) {
-        const testPayload = {
-          groupId: jid,
-          senderId: 'test_system',
-          text: 'dear valued partners test message',
-          messageId: msg.id._serialized || '',
-          hasReply: false,
-          timestamp: new Date().toISOString(),
-          botVersion: BOT_VERSION,
-          isTestMessage: true
-        };
-        
-        sendToN8nWebhook(INTEREST_RATE_WEBHOOK_URL, testPayload, 'INTEREST_RATE');
-      }
-    }
-  });
-  
-  // Start processing if not already running
-  if (!isProcessingQueue) {
-    processMessageQueue();
-  }
-  
-  log('info', `Test interest rate message queued for ${jid}`);
-  
-  // Respond immediately
-  return res.status(202).json({ 
-    success: true, 
-    message: 'Test interest rate message added to queue',
-    queuePosition: messageQueue.length,
-    taskId,
-    messageId: taskId // Add messageId field to match what n8n expects
-  });
-});
-
-// Group creation API endpoints
-// Create group API endpoint
-app.post('/create-group', async (req, res) => {
-  const { groupName, participants } = req.body;
-  
-  if (!client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
-  }
-  
-  if (!groupName) {
-    return res.status(400).json({ success: false, error: 'Missing groupName parameter' });
-  }
-  
-  if (!participants || !Array.isArray(participants) || participants.length === 0) {
-    return res.status(400).json({ success: false, error: 'participants must be a non-empty array of phone numbers' });
-  }
-  
-  try {
-    log('info', `👥 API request to create group "${groupName}" with ${participants.length} participants`);
-    
-    // Format participants as WhatsApp expects
-    const formattedParticipants = participants.map(p => {
-      // Remove any non-numeric characters except + sign
-      let cleaned = p.replace(/[^\d+]/g, '');
-      
-      // Add country code if missing
-      if (!cleaned.startsWith('1') && !cleaned.startsWith('+')) {
-        cleaned = '65' + cleaned; // Using Singapore country code as default
-      }
-      
-      // Add @c.us if missing
-      if (!cleaned.includes('@c.us')) {
-        cleaned = cleaned + '@c.us';
-      }
-      
-      return cleaned;
-    });
-    
-    log('info', `Formatted participants: ${JSON.stringify(formattedParticipants)}`);
-    
-    // Create the group
-    const result = await client.createGroup(groupName, formattedParticipants);
-    
-    if (result && result.gid) {
-      log('info', `✅ Group created successfully via API: ${result.gid}`);
-      
-      // Send welcome message to the group
-      setTimeout(async () => {
-        try {
-          await client.sendMessage(result.gid, `Welcome to the "${groupName}" group! This group was created via the API.`);
-        } catch (err) {
-          log('warn', `Could not send welcome message to new group: ${err.message}`);
-        }
-      }, 3000); // Small delay to ensure group is fully created
-      
-      return res.status(201).json({ 
-        success: true, 
-        groupId: result.gid,
-        groupName,
-        participantCount: formattedParticipants.length
-      });
-    } else {
-      log('error', '❌ Failed to create group via API: Unknown error');
-      return res.status(500).json({ 
-        success: false, 
-        error: 'Unknown error during group creation'
-      });
-    }
-  } catch (err) {
-    log('error', `❌ Error creating group via API: ${err.message}`);
-    return res.status(500).json({ 
-      success: false, 
-      error: err.message
-    });
-  }
-});
-
-// Test endpoint for message that would trigger group creation
-app.post('/test-group-creation-message', async (req, res) => {
-  const { phoneNumber, message } = req.body;
-  
-  if (!client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
-  }
-  
-  if (!phoneNumber) {
-    return res.status(400).json({ success: false, error: 'Missing phoneNumber parameter' });
-  }
-  
-  if (!message || !message.includes('create group:')) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Message must include "create group:" followed by group details' 
-    });
-  }
-  
-  try {
-    // Format phone number
-    let formattedPhone = phoneNumber.replace(/[^\d+]/g, '');
-    if (!formattedPhone.includes('@c.us')) {
-      formattedPhone = formattedPhone + '@c.us';
-    }
-    
-    log('info', `🧪 Sending test group creation message to ${formattedPhone}`);
-    
-    // Parse the group details from the message
-    const groupDetails = parseGroupCreationRequest(message);
-    
-    if (!groupDetails) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Could not parse group creation details from message' 
-      });
-    }
-    
-    // Instead of actually creating the group, just send what would be created
-    await client.sendMessage(formattedPhone, 
-      `✅ Test: Would create group "${groupDetails.groupName}" with participants: ${groupDetails.participants.join(', ')}`
-    );
-    
-    return res.status(200).json({
-      success: true,
-      message: 'Test message sent successfully',
-      parsedDetails: groupDetails
-    });
-  } catch (err) {
-    log('error', `❌ Error sending test message: ${err.message}`);
-    return res.status(500).json({ 
-      success: false, 
-      error: err.message
-    });
-  }
 });
 
 // Get client status endpoint (enhanced)
@@ -2228,7 +1732,6 @@ app.get('/queue', (req, res) => {
     hourly_limit: MAX_MESSAGES_PER_HOUR,
     time_until_reset: lastHourReset + (60 * 60 * 1000) - Date.now(),
     queue_preview: messageQueue.slice(0, 5).map(item => ({
-      taskId: item.taskId,
       jid: item.jid,
       added_at: new Date(item.addedAt).toISOString(),
       message_preview: item.message ? 
@@ -2260,10 +1763,6 @@ app.get('/webhooks', (req, res) => {
     interestRate: {
       configured: Boolean(INTEREST_RATE_WEBHOOK_URL),
       url: INTEREST_RATE_WEBHOOK_URL ? '[configured]' : null,
-    },
-    groupCreation: {
-      configured: true,
-      description: "Available directly via 'create group:' message"
     }
   });
 });
@@ -2375,65 +1874,86 @@ const server = app.listen(PORT, () => {
   }, 5 * 60 * 1000); // Check every 5 minutes
   
   // Enhanced watchdog with memory monitoring and cleanup
-setInterval(async () => {
-  // First, log memory in exactly the format requested
-  const mem = process.memoryUsage();
-  const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
-  const heapUsedMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
-  const heapTotalMB = (mem.heapTotal / 1024 / 1024).toFixed(1);
-  
-  // Log memory stats in exactly the requested format
-  log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapUsedMB}MB, HeapTotal=${heapTotalMB}MB`);
-  
-  // Skip if client is initializing
-  if (isClientInitializing) {
-    return;
-  }
-  
-  // Check if client is missing
-  if (!client) {
-    log('warn', '🕵️ Watchdog: client is missing. Restarting...');
-    await startClient();
-    return;
-  }
-
-  try {
-    // Check WhatsApp connection state
-    const state = await client.getState();
-    log('info', `✅ Watchdog: client state is "${state}".`);
-
-    // Save session on successful watchdog check
-    if (state === 'CONNECTED' && client.authStrategy) {
-      try {
-        if (DEBUG_SESSION) {
-          log('info', '📥 Watchdog forcing session save');
-        }
-        await safelyTriggerSessionSave(client);
-        if (DEBUG_SESSION) {
-          log('info', '📥 Watchdog session save successful');
-        }
-      } catch (err) {
-        log('error', `Failed to save session during watchdog check: ${err.message}`);
-      }
+  setInterval(async () => {
+    // First, log memory in exactly the format requested
+    const mem = process.memoryUsage();
+    const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
+    const heapUsedMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
+    const heapTotalMB = (mem.heapTotal / 1024 / 1024).toFixed(1);
+    
+    // Log memory stats in exactly the requested format
+    log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapUsedMB}MB, HeapTotal=${heapTotalMB}MB`);
+    
+    // Skip if client is initializing
+    if (isClientInitializing) {
+      return;
+    }
+    
+    // Check if client is missing
+    if (!client) {
+      log('warn', '🕵️ Watchdog: client is missing. Restarting...');
+      await startClient();
+      return;
     }
 
-    // Check if memory exceeds threshold (default 450MB) and perform cleanup if needed
-    if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
-      log('warn', `⚠️ Memory usage exceeded ${MEMORY_THRESHOLD_MB}MB (${rssMB}MB). Performing cleanup...`);
-      
-      // Force garbage collection if available
-      if (global.gc) {
-        log('info', '🧹 Running forced garbage collection');
-        global.gc();
+    try {
+      // Check WhatsApp connection state
+      const state = await client.getState();
+      log('info', `✅ Watchdog: client state is "${state}".`);
+
+      // Save session on successful watchdog check
+      if (state === 'CONNECTED' && client.authStrategy) {
+        try {
+          if (DEBUG_SESSION) {
+            log('info', '📥 Watchdog forcing session save');
+          }
+          await safelyTriggerSessionSave(client);
+          if (DEBUG_SESSION) {
+            log('info', '📥 Watchdog session save successful');
+          }
+        } catch (err) {
+          log('error', `Failed to save session during watchdog check: ${err.message}`);
+        }
+      }
+
+      // Check if memory exceeds threshold (default 450MB) and perform cleanup if needed
+      if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
+        log('warn', `⚠️ Memory usage exceeded ${MEMORY_THRESHOLD_MB}MB (${rssMB}MB). Performing cleanup...`);
         
-        // Check if garbage collection helped
-        const afterGC = process.memoryUsage();
-        const afterRssMB = (afterGC.rss / 1024 / 1024).toFixed(1);
-        log('info', `🧹 After GC: RSS=${afterRssMB}MB`);
-        
-        // If still too high, restart the client
-        if (parseFloat(afterRssMB) > MEMORY_THRESHOLD_MB) {
-          log('warn', `⚠️ Memory still high after GC. Restarting client...`);
+        // Force garbage collection if available
+        if (global.gc) {
+          log('info', '🧹 Running forced garbage collection');
+          global.gc();
+          
+          // Check if garbage collection helped
+          const afterGC = process.memoryUsage();
+          const afterRssMB = (afterGC.rss / 1024 / 1024).toFixed(1);
+          log('info', `🧹 After GC: RSS=${afterRssMB}MB`);
+          
+          // If still too high, restart the client
+          if (parseFloat(afterRssMB) > MEMORY_THRESHOLD_MB) {
+            log('warn', `⚠️ Memory still high after GC. Restarting client...`);
+            
+            // Try to save session before restart
+            if (client.authStrategy) {
+              try {
+                log('info', '📥 Saving session before memory-triggered restart');
+                await safelyTriggerSessionSave(client);
+                log('info', '📥 Session saved before memory-triggered restart');
+              } catch (err) {
+                log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+              }
+            }
+            
+            await client.destroy().catch(err => 
+              log('error', `Error destroying client during memory cleanup: ${err.message}`)
+            );
+            client = null;
+            await startClient();
+          }
+        } else {
+          // If GC not available, restart client to reduce memory
+          log('warn', `⚠️ GC not available. Restarting client to reduce memory...`);
           
           // Try to save session before restart
           if (client.authStrategy) {
@@ -2452,84 +1972,64 @@ setInterval(async () => {
           client = null;
           await startClient();
         }
-      } else {
-        // If GC not available, restart client to reduce memory
-        log('warn', `⚠️ GC not available. Restarting client to reduce memory...`);
+      }
+
+      // Additional pupPage check
+      const hasValidPage = Boolean(client.pupPage);
+      if (!hasValidPage) {
+        log('warn', '⚠️ Watchdog: client missing pupPage. Restarting...');
         
         // Try to save session before restart
         if (client.authStrategy) {
           try {
-            log('info', '📥 Saving session before memory-triggered restart');
+            log('info', '📥 Saving session before pupPage-triggered restart');
             await safelyTriggerSessionSave(client);
-            log('info', '📥 Session saved before memory-triggered restart');
+            log('info', '📥 Session saved before pupPage-triggered restart');
           } catch (err) {
-            log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
+            log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
           }
         }
         
         await client.destroy().catch(err => 
-          log('error', `Error destroying client during memory cleanup: ${err.message}`)
+          log('error', `Error destroying client in watchdog: ${err.message}`)
+        );
+        client = null;
+        await startClient();
+        return;
+      }
+
+      if (state !== 'CONNECTED') {
+        log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
+        
+        // Try to save session before restart
+        if (client.authStrategy && state !== null) {
+          try {
+            log('info', '📥 Saving session before state-triggered restart');
+            await safelyTriggerSessionSave(client);
+            log('info', '📥 Session saved before state-triggered restart');
+          } catch (err) {
+            log('error', `Failed to save session before state-triggered restart: ${err.message}`);
+          }
+        }
+        
+        await client.destroy().catch(err => 
+          log('error', `Error destroying client in watchdog: ${err.message}`)
         );
         client = null;
         await startClient();
       }
-    }
-
-    // Additional pupPage check
-    const hasValidPage = Boolean(client.pupPage);
-    if (!hasValidPage) {
-      log('warn', '⚠️ Watchdog: client missing pupPage. Restarting...');
-      
-      // Try to save session before restart
-      if (client.authStrategy) {
-        try {
-          log('info', '📥 Saving session before pupPage-triggered restart');
-          await safelyTriggerSessionSave(client);
-          log('info', '📥 Session saved before pupPage-triggered restart');
-        } catch (err) {
-          log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
-        }
+    } catch (err) {
+      log('error', `🚨 Watchdog error: ${err.message}. Restarting...`);
+      if (client) {
+        await client.destroy().catch(destroyErr => 
+          log('error', `Error destroying client after watchdog error: ${destroyErr.message}`)
+        );
       }
-      
-      await client.destroy().catch(err => 
-        log('error', `Error destroying client in watchdog: ${err.message}`)
-      );
-      client = null;
-      await startClient();
-      return;
-    }
-
-    if (state !== 'CONNECTED') {
-      log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
-      
-      // Try to save session before restart
-      if (client.authStrategy && state !== null) {
-        try {
-          log('info', '📥 Saving session before state-triggered restart');
-          await safelyTriggerSessionSave(client);
-          log('info', '📥 Session saved before state-triggered restart');
-        } catch (err) {
-          log('error', `Failed to save session before state-triggered restart: ${err.message}`);
-        }
-      }
-      
-      await client.destroy().catch(err => 
-        log('error', `Error destroying client in watchdog: ${err.message}`)
-      );
       client = null;
       await startClient();
     }
-  } catch (err) {
-    log('error', `🚨 Watchdog error: ${err.message}. Restarting...`);
-    if (client) {
-      await client.destroy().catch(destroyErr => 
-        log('error', `Error destroying client after watchdog error: ${destroyErr.message}`)
-      );
-    }
-    client = null;
-    await startClient();
-  }
-}, WATCHDOG_INTERVAL);
+  }, WATCHDOG_INTERVAL);
+});
 
 // Add any additional cleanup or shutdown handlers
 process.on('SIGTERM', async () => {
@@ -2557,6 +2057,3 @@ process.on('SIGINT', async () => {
   }
   process.exit(0);
 });
-
-// Export app for testing if needed
-module.exports = { app, server, client };})
