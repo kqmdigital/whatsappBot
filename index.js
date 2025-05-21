@@ -751,14 +751,7 @@ async function checkBrowserHealth(client) {
   }
   
   try {
-    // Check if browser process is still running
-    const processes = await client.pupBrowser.process().catch(() => null);
-    if (!processes) {
-      log('warn', '⚠️ Browser process not found');
-      return false;
-    }
-    
-    // Check if page is responsive
+    // Check if page is responsive (most important check)
     const isPageResponsive = await client.pupPage.evaluate(() => true).catch(() => false);
     if (!isPageResponsive) {
       log('warn', '⚠️ Puppeteer page is not responsive');
@@ -774,6 +767,9 @@ async function checkBrowserHealth(client) {
       log('warn', '⚠️ WhatsApp Web is not properly loaded');
       return false;
     }
+    
+    // Skip browser process check as it's causing issues
+    // client.pupBrowser.process() doesn't return a promise
     
     return true;
   } catch (err) {
