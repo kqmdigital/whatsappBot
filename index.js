@@ -636,7 +636,7 @@ function createWhatsAppClient() {
       protocolTimeout: 90000, // Protocol timeout to reduce errors
     },
     webVersionCache: {
-       type: 'remote', // Change to local for better stability
+       type: 'local', // Change to local for better stability
     },
     qrMaxRetries: 3, // Add this to limit QR code attempts
   restartOnAuthFail: true,
