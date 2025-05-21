@@ -287,12 +287,17 @@ class EnhancedLocalAuth extends LocalAuth {
   }
 
  async afterInit(client) {
-  await super.afterInit(client);
-  
-  // Keep a reference to the client for session extraction
-  this.client = client;
+  log('info', '🔄 afterInit called - starting session restoration process');
   
   try {
+    // Call parent afterInit but make sure it doesn't block our restoration
+    super.afterInit(client).catch(err => {
+      log('warn', `Parent afterInit error (continuing anyway): ${err.message}`);
+    });
+    
+    // Keep a reference to the client for session extraction
+    this.client = client;
+    
     log('info', '🔍 Attempting to restore session from Supabase...');
     
     // Try to load session from Supabase first
@@ -326,10 +331,19 @@ class EnhancedLocalAuth extends LocalAuth {
           const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
           if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
+            log('info', `Created session directory: ${sessionDir}`);
           }
           
+          // Make sure to clear any existing session file first
+          const sessionFile = path.join(sessionDir, 'session.json');
+          if (fs.existsSync(sessionFile)) {
+            log('info', 'Removing existing session file before writing new one');
+            fs.unlinkSync(sessionFile);
+          }
+          
+          // Write the session data
           await fs.promises.writeFile(
-            path.join(sessionDir, 'session.json'),
+            sessionFile,
             JSON.stringify(data.session_data),
             { encoding: 'utf8' }
           );
@@ -337,12 +351,12 @@ class EnhancedLocalAuth extends LocalAuth {
           log('info', '✅ Session restored from Supabase to local storage');
           
           // Add a forced delay to ensure proper session loading
-          log('info', '⏳ Waiting 3 seconds for session to be properly applied...');
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          log('info', '⏳ Waiting 5 seconds for session to be properly applied...');
+          await new Promise(resolve => setTimeout(resolve, 5000));
           
           // Verify the file was written correctly
           const savedContent = await fs.promises.readFile(
-            path.join(sessionDir, 'session.json'),
+            sessionFile,
             { encoding: 'utf8' }
           );
           
@@ -366,11 +380,15 @@ class EnhancedLocalAuth extends LocalAuth {
           }
         }
       }
+      
+      // Signal that we've successfully restored the session
+      log('info', '🎉 Session restoration process completed successfully');
     } else {
       log('info', '❓ No session data found in Supabase');
     }
   } catch (err) {
-    log('warn', `Failed to restore session from Supabase: ${err.message}`);
+    log('error', `❌ Error in afterInit: ${err.message}`);
+    log('error', err.stack);
   }
 }
   
@@ -1079,6 +1097,37 @@ async function startClient() {
     const hasValidSession = await checkSessionStatus();
     if (!hasValidSession) {
       log('info', '🔄 No valid session found, starting fresh authentication');
+    } else {
+      log('info', '✅ Valid session found in Supabase, will restore');
+      
+      // IMPORTANT: Pre-create the session directory and file with the content from Supabase
+      // This helps ensure the session is available before WhatsApp-web.js tries to use it
+      try {
+        const { data } = await supabase
+          .from('whatsapp_sessions')
+          .select('session_data')
+          .eq('session_key', SESSION_ID)
+          .single();
+          
+        if (data?.session_data) {
+          const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+          if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
+            log('info', `📁 Created session directory: ${sessionDir}`);
+          }
+          
+          const sessionFile = path.join(sessionDir, 'session.json');
+          await fs.promises.writeFile(
+            sessionFile,
+            JSON.stringify(data.session_data),
+            { encoding: 'utf8' }
+          );
+          
+          log('info', '🔑 Pre-loaded session data from Supabase before client initialization');
+        }
+      } catch (err) {
+        log('warn', `⚠️ Failed to pre-load session: ${err.message}`);
+      }
     }
     
     log('info', '🚀 Starting WhatsApp client...');
@@ -1094,6 +1143,10 @@ async function startClient() {
     
     setupClientEvents(client);
 
+    // Add a delay before initialization to ensure session files are properly set up
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    log('info', '🚀 Starting client initialization');
+    
     await client.initialize();
     log('info', '✅ WhatsApp client initialized.');
     
