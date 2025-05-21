@@ -645,7 +645,7 @@ function createWhatsAppClient() {
   multiDevice: true,
   sessionCacheEnabled: true,
   clearSessionOnLogout: false, // Add this to preserve session on logout
-  webVersion: '2.2318.11', // Try specifying a stable WhatsApp Web version
+ 
 });
 }
 
