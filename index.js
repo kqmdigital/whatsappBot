@@ -18,7 +18,7 @@ const { default: PQueue } = require('p-queue');
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '2.0.0';
+const BOT_VERSION = '2.0.1'; // Updated version
 const startedAt = Date.now();
 
 // Enhanced logging with levels
@@ -90,9 +90,9 @@ async function downloadMedia(url, options = {}) {
 }
 
 // Performance settings
-const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB || '450');
+const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB || '400'); // Reduced from 450MB to 400MB
 const RECONNECT_DELAY = parseInt(process.env.RECONNECT_DELAY || '10000');
-const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '300000'); // 5 minutes
+const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '180000'); // Reduced from 5 minutes to 3 minutes
 const DEBUG_SESSION = process.env.DEBUG_SESSION === 'true' || false;
 let MAX_MESSAGES_PER_HOUR = 90; // Default, can be increased for regular accounts
 
@@ -135,6 +135,18 @@ async function extractSessionData(client) {
   }
   
   try {
+    // Check if page is still usable
+    try {
+      const isPageAlive = await client.pupPage.evaluate(() => true).catch(() => false);
+      if (!isPageAlive) {
+        log('warn', '⚠️ Puppeteer page is no longer responsive, cannot extract data');
+        return null;
+      }
+    } catch (pageErr) {
+      log('warn', `⚠️ Error checking page status: ${pageErr.message}`);
+      return null;
+    }
+    
     // Improved localStorage extraction 
     const rawLocalStorage = await client.pupPage.evaluate(() => {
       try {
@@ -161,6 +173,9 @@ async function extractSessionData(client) {
         console.error("Error extracting localStorage:", e);
         return { error: e.toString() };
       }
+    }).catch(err => {
+      log('warn', `⚠️ Error during page evaluation: ${err.message}`);
+      return { error: err.message };
     });
     
     if (rawLocalStorage && rawLocalStorage.error) {
@@ -218,22 +233,22 @@ async function safelyTriggerSessionSave(client) {
         log('info', '📥 Session save triggered with valid data');
 
         // Extra: Create a backup copy of session data directly to file system
-try {
-  const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-  if (!fs.existsSync(sessionDir)) {
-    fs.mkdirSync(sessionDir, { recursive: true });
-  }
-  
-  const backupFile = path.join(sessionDir, 'session_backup.json');
-  await fs.promises.writeFile(
-    backupFile,
-    JSON.stringify(sessionData),
-    { encoding: 'utf8' }
-  );
-  log('info', '📥 Created additional filesystem backup of session');
-} catch (backupErr) {
-  log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
-}
+        try {
+          const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+          if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
+          }
+          
+          const backupFile = path.join(sessionDir, 'session_backup.json');
+          await fs.promises.writeFile(
+            backupFile,
+            JSON.stringify(sessionData),
+            { encoding: 'utf8' }
+          );
+          log('info', '📥 Created additional filesystem backup of session');
+        } catch (backupErr) {
+          log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
+        }
         return true;
       } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
         // For RemoteAuth fallback
@@ -306,111 +321,111 @@ class EnhancedLocalAuth extends LocalAuth {
     }
   }
 
- async afterInit(client) {
-  log('info', '🔄 afterInit called - starting session restoration process');
-  
-  try {
-    // Call parent afterInit but make sure it doesn't block our restoration
-    super.afterInit(client).catch(err => {
-      log('warn', `Parent afterInit error (continuing anyway): ${err.message}`);
-    });
+  async afterInit(client) {
+    log('info', '🔄 afterInit called - starting session restoration process');
     
-    // Keep a reference to the client for session extraction
-    this.client = client;
-    
-    log('info', '🔍 Attempting to restore session from Supabase...');
-    
-    // Try to load session from Supabase first
-    const { data, error } = await this.supabase
-      .from('whatsapp_sessions')
-      .select('session_data')
-      .eq('session_key', this.sessionId)
-      .single();
-    
-    if (error) {
-      log('warn', `Failed to query session from Supabase: ${error.message}`);
-      return;
-    }
-    
-    if (data?.session_data) {
-      // Check if session data is valid
-      const sessionSize = JSON.stringify(data.session_data).length;
-      if (sessionSize < 5000) {
-        log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
+    try {
+      // Call parent afterInit but make sure it doesn't block our restoration
+      super.afterInit(client).catch(err => {
+        log('warn', `Parent afterInit error (continuing anyway): ${err.message}`);
+      });
+      
+      // Keep a reference to the client for session extraction
+      this.client = client;
+      
+      log('info', '🔍 Attempting to restore session from Supabase...');
+      
+      // Try to load session from Supabase first
+      const { data, error } = await this.supabase
+        .from('whatsapp_sessions')
+        .select('session_data')
+        .eq('session_key', this.sessionId)
+        .single();
+      
+      if (error) {
+        log('warn', `Failed to query session from Supabase: ${error.message}`);
         return;
       }
       
-      log('info', `✅ Found valid session in Supabase (${sessionSize} bytes)`);
-      
-      // Save to local storage with retries
-      let retries = 0;
-      const maxRetries = 3;
-      
-      while (retries < maxRetries) {
-        try {
-          const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
-          if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir, { recursive: true });
-            log('info', `Created session directory: ${sessionDir}`);
-          }
-          
-          // Make sure to clear any existing session file first
-          const sessionFile = path.join(sessionDir, 'session.json');
-          if (fs.existsSync(sessionFile)) {
-            log('info', 'Removing existing session file before writing new one');
-            fs.unlinkSync(sessionFile);
-          }
-          
-          // Write the session data
-          await fs.promises.writeFile(
-            sessionFile,
-            JSON.stringify(data.session_data),
-            { encoding: 'utf8' }
-          );
-          
-          log('info', '✅ Session restored from Supabase to local storage');
-          
-          // Add a forced delay to ensure proper session loading
-          log('info', '⏳ Waiting 5 seconds for session to be properly applied...');
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          
-          // Verify the file was written correctly
-          const savedContent = await fs.promises.readFile(
-            sessionFile,
-            { encoding: 'utf8' }
-          );
-          
-          if (savedContent && savedContent.length > 5000) {
-            log('info', '✓ Session file verification successful');
-            break; // Success - exit retry loop
-          } else {
-            throw new Error('Session file verification failed');
-          }
-        } catch (writeErr) {
-          retries++;
-          log('warn', `Session restoration attempt ${retries}/${maxRetries} failed: ${writeErr.message}`);
-          
-          if (retries >= maxRetries) {
-            log('error', `❌ Failed to restore session after ${maxRetries} attempts`);
-          } else {
-            // Wait before retry with exponential backoff
-            const delay = 1000 * Math.pow(2, retries);
-            log('info', `⏱️ Waiting ${delay}ms before retry...`);
-            await new Promise(resolve => setTimeout(resolve, delay));
+      if (data?.session_data) {
+        // Check if session data is valid
+        const sessionSize = JSON.stringify(data.session_data).length;
+        if (sessionSize < 5000) {
+          log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
+          return;
+        }
+        
+        log('info', `✅ Found valid session in Supabase (${sessionSize} bytes)`);
+        
+        // Save to local storage with retries
+        let retries = 0;
+        const maxRetries = 3;
+        
+        while (retries < maxRetries) {
+          try {
+            const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
+            if (!fs.existsSync(sessionDir)) {
+              fs.mkdirSync(sessionDir, { recursive: true });
+              log('info', `Created session directory: ${sessionDir}`);
+            }
+            
+            // Make sure to clear any existing session file first
+            const sessionFile = path.join(sessionDir, 'session.json');
+            if (fs.existsSync(sessionFile)) {
+              log('info', 'Removing existing session file before writing new one');
+              fs.unlinkSync(sessionFile);
+            }
+            
+            // Write the session data
+            await fs.promises.writeFile(
+              sessionFile,
+              JSON.stringify(data.session_data),
+              { encoding: 'utf8' }
+            );
+            
+            log('info', '✅ Session restored from Supabase to local storage');
+            
+            // Add a forced delay to ensure proper session loading
+            log('info', '⏳ Waiting 5 seconds for session to be properly applied...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // Verify the file was written correctly
+            const savedContent = await fs.promises.readFile(
+              sessionFile,
+              { encoding: 'utf8' }
+            );
+            
+            if (savedContent && savedContent.length > 5000) {
+              log('info', '✓ Session file verification successful');
+              break; // Success - exit retry loop
+            } else {
+              throw new Error('Session file verification failed');
+            }
+          } catch (writeErr) {
+            retries++;
+            log('warn', `Session restoration attempt ${retries}/${maxRetries} failed: ${writeErr.message}`);
+            
+            if (retries >= maxRetries) {
+              log('error', `❌ Failed to restore session after ${maxRetries} attempts`);
+            } else {
+              // Wait before retry with exponential backoff
+              const delay = 1000 * Math.pow(2, retries);
+              log('info', `⏱️ Waiting ${delay}ms before retry...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+            }
           }
         }
+        
+        // Signal that we've successfully restored the session
+        log('info', '🎉 Session restoration process completed successfully');
+      } else {
+        log('info', '❓ No session data found in Supabase');
       }
-      
-      // Signal that we've successfully restored the session
-      log('info', '🎉 Session restoration process completed successfully');
-    } else {
-      log('info', '❓ No session data found in Supabase');
+    } catch (err) {
+      log('error', `❌ Error in afterInit: ${err.message}`);
+      log('error', err.stack);
     }
-  } catch (err) {
-    log('error', `❌ Error in afterInit: ${err.message}`);
-    log('error', err.stack);
   }
-}
   
   async save(session) {
     // Check if session is valid and has sufficient data
@@ -421,6 +436,14 @@ class EnhancedLocalAuth extends LocalAuth {
       if (this.client && this.client.pupPage) {
         try {
           log('info', 'Attempting direct localStorage extraction as last resort');
+          
+          // Check if page is still responsive
+          const isPageAlive = await this.client.pupPage.evaluate(() => true).catch(() => false);
+          if (!isPageAlive) {
+            log('warn', '⚠️ Puppeteer page is no longer responsive, cannot extract data directly');
+            return;
+          }
+          
           const rawLocalStorage = await this.client.pupPage.evaluate(() => {
             const data = {};
             for (let i = 0; i < localStorage.length; i++) {
@@ -428,6 +451,9 @@ class EnhancedLocalAuth extends LocalAuth {
               data[key] = localStorage.getItem(key);
             }
             return data;
+          }).catch(err => {
+            log('error', `Direct localStorage evaluation failed: ${err.message}`);
+            return null;
           });
           
           if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
@@ -553,6 +579,7 @@ let connectionRetryCount = 0;
 let isClientInitializing = false;
 let currentQRCode = null;
 let lastActivityTime = Date.now();
+let lastBrowserReset = Date.now(); // New variable to track browser resets
 
 // Function to detect if using a business number
 async function detectBusinessAccount(client) {
@@ -626,27 +653,35 @@ function createWhatsAppClient() {
         '--disable-extensions',
         '--window-size=1280,720', // Larger viewport helps with business number UI
         '--disable-features=site-per-process',
-        '--js-flags="--max-old-space-size=350"', // Increased memory limit
+        '--js-flags="--max-old-space-size=300"', // Reduced memory limit from 350 to 300
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
         '--disable-site-isolation-trials',
+        '--single-process', // Add single-process mode to reduce memory usage
+        '--disable-breakpad', // Disable crash reporting
+        '--disable-component-extensions-with-background-pages', // Reduce memory usage
       ],
       defaultViewport: null, // Allow responsive viewport
-      timeout: 180000, // 2 minute timeout for browser launch
-      protocolTimeout: 90000, // Protocol timeout to reduce errors
+      timeout: 120000, // Reduced from 180000 to 120000 (2 minutes)
+      protocolTimeout: 60000, // Reduced from 90000 to 60000 (1 minute)
+      handleSIGINT: false, // Don't let Puppeteer handle SIGINT, we'll do it ourselves
+      handleSIGTERM: false, // Don't let Puppeteer handle SIGTERM, we'll do it ourselves
+      handleSIGHUP: false, // Don't let Puppeteer handle SIGHUP, we'll do it ourselves
     },
     webVersionCache: {
-       type: 'local', // Change to local for better stability
+      type: 'local', // Use local caching for better stability
+      path: path.join(__dirname, '.wwebjs_cache'),
+      lockTimeoutMs: 30000, // 30 second lock timeout
+      maxTimeoutMs: 60000, // 60 second max timeout
     },
-    qrMaxRetries: 3, // Add this to limit QR code attempts
-  restartOnAuthFail: true,
-  takeoverOnConflict: true,
-  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  multiDevice: true,
-  sessionCacheEnabled: true,
-  clearSessionOnLogout: false, // Add this to preserve session on logout
- 
-});
+    qrMaxRetries: 3, // Limit QR code attempts
+    restartOnAuthFail: true,
+    takeoverOnConflict: true,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    multiDevice: true,
+    sessionCacheEnabled: true, 
+    clearSessionOnLogout: false, // Preserve session on logout
+  });
 }
 
 // Handle Render sleep detection and preparation
@@ -707,6 +742,85 @@ async function clearInvalidSession() {
     log('error', `Failed to clear invalid session: ${err.message}`);
     return false;
   }
+}
+
+// Function to check browser health
+async function checkBrowserHealth(client) {
+  if (!client || !client.pupPage || !client.pupBrowser) {
+    return false;
+  }
+  
+  try {
+    // Check if browser process is still running
+    const processes = await client.pupBrowser.process().catch(() => null);
+    if (!processes) {
+      log('warn', '⚠️ Browser process not found');
+      return false;
+    }
+    
+    // Check if page is responsive
+    const isPageResponsive = await client.pupPage.evaluate(() => true).catch(() => false);
+    if (!isPageResponsive) {
+      log('warn', '⚠️ Puppeteer page is not responsive');
+      return false;
+    }
+    
+    // Check if WhatsApp Web is properly loaded
+    const isWAWebLoaded = await client.pupPage.evaluate(() => {
+      return typeof window.Store !== 'undefined' && window.Store !== null;
+    }).catch(() => false);
+    
+    if (!isWAWebLoaded) {
+      log('warn', '⚠️ WhatsApp Web is not properly loaded');
+      return false;
+    }
+    
+    return true;
+  } catch (err) {
+    log('error', `Browser health check failed: ${err.message}`);
+    return false;
+  }
+}
+
+// New function to periodically reset browser to prevent memory leaks and crashes
+async function performPeriodicBrowserReset() {
+  const BROWSER_RESET_INTERVAL = 8 * 60 * 60 * 1000; // 8 hours
+  const now = Date.now();
+  
+  if (now - lastBrowserReset < BROWSER_RESET_INTERVAL) {
+    return false; // Not time to reset yet
+  }
+  
+  log('info', '🔄 Performing scheduled browser reset to prevent memory issues');
+  
+  // Make sure we save session before the reset
+  if (client && client.authStrategy) {
+    try {
+      await safelyTriggerSessionSave(client);
+      log('info', '📥 Session saved before browser reset');
+    } catch (err) {
+      log('error', `Failed to save session before browser reset: ${err.message}`);
+    }
+  }
+  
+  // Destroy the client and restart
+  if (client) {
+    try {
+      await client.destroy();
+      log('info', '🧹 Client destroyed for scheduled reset');
+    } catch (err) {
+      log('error', `Error destroying client during scheduled reset: ${err.message}`);
+    } finally {
+      client = null;
+    }
+  }
+  
+  // Reset the counter
+  lastBrowserReset = now;
+  
+  // Start client after a short delay
+  setTimeout(startClient, 5000);
+  return true;
 }
 
 function setupClientEvents(c) {
@@ -856,6 +970,24 @@ function setupClientEvents(c) {
       }
     }
   });
+  
+  // Add error handler to catch unexpected puppeteer/browser errors
+  if (c.pupBrowser) {
+    c.pupBrowser.on('disconnected', () => {
+      log('warn', '⚠️ Browser disconnected unexpectedly');
+      if (sessionState === SESSION_STATES.CONNECTED) {
+        log('info', 'Browser disconnect detected while connection was active, triggering reconnect');
+        if (client === c) { // Only if this is still the current client
+          setTimeout(() => {
+            if (client === c) { // Double-check
+              client = null;
+              startClient();
+            }
+          }, 5000);
+        }
+      }
+    });
+  }
 }
 
 let messageCount = 0;
@@ -1152,6 +1284,7 @@ async function forceSessionRestoration() {
     return false;
   }
 }
+
 // Improved client starter with mutex to prevent multiple initializations
 async function startClient() {
   if (isClientInitializing) {
@@ -1218,24 +1351,31 @@ async function startClient() {
     }, 1000);
     
     setupClientEvents(client);
-// In your startClient function
-log('info', '🚀 Starting WhatsApp client...');
-client = createWhatsAppClient();
-
-// Add a longer delay before initialization
-log('info', '⏱️ Waiting 5 seconds before initialization...');
+    
+    // Add a longer delay before initialization
+    log('info', '⏱️ Waiting 5 seconds before initialization...');
     // Add a delay before initialization to ensure session files are properly set up
     await new Promise(resolve => setTimeout(resolve, 5000));
     log('info', '🚀 Starting client initialization');
     
-    await client.initialize();
+    // Add timeout guard for initialization
+    const initPromise = client.initialize();
+    
+    // Set timeout for initialization
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Client initialization timed out after 3 minutes')), 180000);
+    });
+    
+    // Race between initialization and timeout
+    await Promise.race([initPromise, timeoutPromise]);
+    
     log('info', '✅ WhatsApp client initialized.');
     
     // Reset activity time on successful initialization
     lastActivityTime = Date.now();
     
     // Try to force save session right after successful initialization
-    if (client.authStrategy) {
+    if (client && client.authStrategy) {
       try {
         // Double-check client reference is set
         if (!client.authStrategy.client) {
@@ -1250,6 +1390,9 @@ log('info', '⏱️ Waiting 5 seconds before initialization...');
         log('error', `📥 Failed to save session after initialization: ${err.message}`);
       }
     }
+    
+    // Reset browser reset timer on successful initialization
+    lastBrowserReset = Date.now();
   } catch (err) {
     log('error', `❌ WhatsApp client failed to initialize: ${err.message}`);
     updateSessionState(SESSION_STATES.FAILED, { reason: err.message });
@@ -1636,6 +1779,15 @@ app.get('/message/:messageId', async (req, res) => {
     }
     
     try {
+      // Check browser health before attempting to get message
+      const isBrowserHealthy = await checkBrowserHealth(client);
+      if (!isBrowserHealthy) {
+        return res.status(503).json({
+          success: false,
+          error: 'Browser not healthy, cannot retrieve message status'
+        });
+      }
+      
       // Try to get message status
       const message = await client.getMessageById(messageId);
       
@@ -1696,6 +1848,31 @@ app.post('/send-message', async (req, res) => {
 
   if (!client) {
     return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
+  }
+  
+  // Check browser health before adding to queue
+  const isBrowserHealthy = await checkBrowserHealth(client);
+  if (!isBrowserHealthy) {
+    log('warn', '⚠️ Browser health check failed before sending message, initiating restart');
+    
+    // Trigger client restart in the background
+    setTimeout(async () => {
+      if (client) {
+        try {
+          await client.destroy();
+        } catch (err) {
+          log('error', `Error destroying client after health check failure: ${err.message}`);
+        } finally {
+          client = null;
+          startClient();
+        }
+      }
+    }, 1000);
+    
+    return res.status(503).json({ 
+      success: false, 
+      error: 'WhatsApp browser needs to restart, please retry in 30 seconds' 
+    });
   }
   
   // Validate URL to prevent request forgery if imageUrl provided
@@ -1835,7 +2012,17 @@ app.get('/status', async (req, res) => {
       });
     }
     
-    const state = await client.getState();
+    // Check browser health
+    const isBrowserHealthy = await checkBrowserHealth(client);
+    
+    let state;
+    try {
+      state = await client.getState();
+    } catch (stateErr) {
+      log('warn', `Failed to get client state: ${stateErr.message}`);
+      state = 'unknown';
+    }
+    
     const connectionState = client.pupPage ? 'connected' : 'disconnected';
     const mem = process.memoryUsage();
     
@@ -1849,10 +2036,12 @@ app.get('/status', async (req, res) => {
       status: state,
       sessionState: sessionState,
       connectionState,
+      browserHealth: isBrowserHealthy,
       connectionRetries: connectionRetryCount,
       uptime: Math.floor((Date.now() - startedAt) / 1000),
       inactiveSeconds: inactiveTime,
       isBusinessAccount: isBusinessAccount,
+      timeSinceLastBrowserReset: Math.floor((Date.now() - lastBrowserReset) / 1000),
       webhooks: {
         valuation: Boolean(VALUATION_WEBHOOK_URL),
         interestRate: Boolean(INTEREST_RATE_WEBHOOK_URL)
@@ -1868,6 +2057,7 @@ app.get('/status', async (req, res) => {
         heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
         heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
         external: Math.round(mem.external / 1024 / 1024),
+        threshold: MEMORY_THRESHOLD_MB
       },
       messagesProcessed: messageCount,
       needsQrScan: Boolean(currentQRCode),
@@ -1884,7 +2074,56 @@ app.get('/status', async (req, res) => {
   }
 });
 
-// Force session save endpoint
+// Force browser health check endpoint
+app.post('/check-browser', async (req, res) => {
+  if (!client) {
+    return res.status(503).json({ 
+      success: false, 
+      error: 'Client not initialized' 
+    });
+  }
+  
+  try {
+    const isHealthy = await checkBrowserHealth(client);
+    
+    if (!isHealthy) {
+      log('warn', '⚠️ Manual browser health check failed, scheduling restart');
+      
+      res.status(200).json({
+        success: true,
+        healthy: false,
+        action: 'restart_scheduled',
+        message: 'Browser health check failed, restart scheduled'
+      });
+      
+      // Schedule restart in background
+      setTimeout(async () => {
+        if (client) {
+          try {
+            await client.destroy();
+          } catch (err) {
+            log('error', `Error destroying client after manual health check: ${err.message}`);
+          } finally {
+            client = null;
+            startClient();
+          }
+        }
+      }, 1000);
+    } else {
+      res.status(200).json({
+        success: true,
+        healthy: true,
+        message: 'Browser health check passed'
+      });
+    }
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
 // Force session save endpoint with verification
 app.post('/save-session', async (req, res) => {
   if (!client || !client.authStrategy) {
@@ -1935,6 +2174,19 @@ app.post('/save-session', async (req, res) => {
       error: err.message 
     });
   }
+});
+
+// Force browser reset endpoint
+app.post('/reset-browser', async (req, res) => {
+  log('info', '🔄 Manual browser reset requested');
+  
+  res.status(202).json({ 
+    success: true, 
+    message: 'Browser reset initiated' 
+  });
+  
+  // Force next watchdog check to restart the browser
+  await performPeriodicBrowserReset();
 });
 
 // Force restart endpoint
@@ -2033,6 +2285,9 @@ app.get('/health', async (req, res) => {
     // Check WhatsApp client
     const clientState = client ? await client.getState() : 'NO_CLIENT';
     
+    // Check browser health
+    const isBrowserHealthy = client ? await checkBrowserHealth(client) : false;
+    
     // Check Supabase connection
     let supabaseStatus = 'UNKNOWN';
     try {
@@ -2047,7 +2302,7 @@ app.get('/health', async (req, res) => {
     
     // Build health response
     const health = {
-      status: clientState === 'CONNECTED' && supabaseStatus === 'CONNECTED' ? 'healthy' : 'degraded',
+      status: clientState === 'CONNECTED' && supabaseStatus === 'CONNECTED' && isBrowserHealthy ? 'healthy' : 'degraded',
       version: BOT_VERSION,
       uptime: {
         seconds: Math.floor((Date.now() - startedAt) / 1000),
@@ -2056,6 +2311,8 @@ app.get('/health', async (req, res) => {
       whatsapp: {
         state: clientState,
         ready: client ? true : false,
+        browserHealth: isBrowserHealthy,
+        timeSinceLastReset: formatUptime(Date.now() - lastBrowserReset),
       },
       webhooks: {
         valuation: Boolean(VALUATION_WEBHOOK_URL),
@@ -2067,6 +2324,7 @@ app.get('/health', async (req, res) => {
           rss: `${(mem.rss / 1024 / 1024).toFixed(1)} MB`,
           heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`,
           heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB`,
+          threshold: `${MEMORY_THRESHOLD_MB} MB`,
         },
         nodejs: process.version,
       },
@@ -2106,217 +2364,14 @@ const server = app.listen(PORT, () => {
   log('info', `💰 Interest rate webhook: ${INTEREST_RATE_WEBHOOK_URL ? 'Configured' : 'Not configured'}`);
   
   // Force restoration attempt before checking status
-forceSessionRestoration().then(() => {
-  // Check if session is valid first, and delete if not
-  checkSessionStatus().then(hasValidSession => {
-    if (!hasValidSession) {
-      log('warn', '⚠️ Invalid or missing session detected. Will ask for QR code on startup.');
-    }
-    
-    // Start WhatsApp client
-    startClient();
-  });
-});
-  
-  // Setup self-ping to keep service alive
-  setInterval(() => {
-    log.debug('🏓 Self-ping successful');
-  }, 60000); // Every minute
-  
-  // Add Render sleep detection - check for inactivity
-  setInterval(() => {
-    const inactiveTime = Date.now() - lastActivityTime;
-    
-    // If inactive for 10+ minutes, prepare for potential sleep
-    if (inactiveTime > 10 * 60 * 1000) {
-      log('warn', `⚠️ Detected ${Math.round(inactiveTime/60000)}min inactivity, preparing for potential sleep`);
-      handleRenderSleep().catch(err => 
-        log('error', `Failed during sleep preparation: ${err.message}`)
-      );
-    }
-  }, 5 * 60 * 1000); // Check every 5 minutes
-  
-  // Enhanced watchdog with memory monitoring and cleanup
-  setInterval(async () => {
-    // First, log memory in exactly the format requested
-    const mem = process.memoryUsage();
-    const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
-    const heapUsedMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
-    const heapTotalMB = (mem.heapTotal / 1024 / 1024).toFixed(1);
-    
-    // Log memory stats in exactly the requested format
-    log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapUsedMB}MB, HeapTotal=${heapTotalMB}MB`);
-    
-    // Skip if client is initializing
-    if (isClientInitializing) {
-      return;
-    }
-    
-    // Check if client is missing
-    if (!client) {
-      log('warn', '🕵️ Watchdog: client is missing. Restarting...');
-      await startClient();
-      return;
-    }
-
-    try {
-      // Check WhatsApp connection state
-      const state = await client.getState();
-      log('info', `✅ Watchdog: client state is "${state}".`);
-
-      // Save session on successful watchdog check
-      if (state === 'CONNECTED' && client.authStrategy) {
-        try {
-          if (DEBUG_SESSION) {
-            log('info', '📥 Watchdog forcing session save');
-          }
-          await safelyTriggerSessionSave(client);
-          if (DEBUG_SESSION) {
-            log('info', '📥 Watchdog session save successful');
-          }
-        } catch (err) {
-          log('error', `Failed to save session during watchdog check: ${err.message}`);
-        }
+  forceSessionRestoration().then(() => {
+    // Check if session is valid first, and delete if not
+    checkSessionStatus().then(hasValidSession => {
+      if (!hasValidSession) {
+        log('warn', '⚠️ Invalid or missing session detected. Will ask for QR code on startup.');
       }
-
-      // Check if memory exceeds threshold (default 450MB) and perform cleanup if needed
-      if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
-        log('warn', `⚠️ Memory usage exceeded ${MEMORY_THRESHOLD_MB}MB (${rssMB}MB). Performing cleanup...`);
-        
-        // Force garbage collection if available
-        if (global.gc) {
-          log('info', '🧹 Running forced garbage collection');
-          global.gc();
-          
-          // Check if garbage collection helped
-          const afterGC = process.memoryUsage();
-          const afterRssMB = (afterGC.rss / 1024 / 1024).toFixed(1);
-          log('info', `🧹 After GC: RSS=${afterRssMB}MB`);
-          
-          // If still too high, restart the client
-          if (parseFloat(afterRssMB) > MEMORY_THRESHOLD_MB) {
-            log('warn', `⚠️ Memory still high after GC. Restarting client...`);
-            
-            // Try to save session before restart
-            if (client.authStrategy) {
-              try {
-                log('info', '📥 Saving session before memory-triggered restart');
-                await safelyTriggerSessionSave(client);
-                log('info', '📥 Session saved before memory-triggered restart');
-              } catch (err) {
-                log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
-              }
-            }
-            
-            await client.destroy().catch(err => 
-              log('error', `Error destroying client during memory cleanup: ${err.message}`)
-            );
-            client = null;
-            await startClient();
-          }
-        } else {
-          // If GC not available, restart client to reduce memory
-          log('warn', `⚠️ GC not available. Restarting client to reduce memory...`);
-          
-          // Try to save session before restart
-          if (client.authStrategy) {
-            try {
-              log('info', '📥 Saving session before memory-triggered restart');
-              await safelyTriggerSessionSave(client);
-              log('info', '📥 Session saved before memory-triggered restart');
-            } catch (err) {
-              log('error', `Failed to save session before memory-triggered restart: ${err.message}`);
-            }
-          }
-          
-          await client.destroy().catch(err => 
-            log('error', `Error destroying client during memory cleanup: ${err.message}`)
-          );
-          client = null;
-          await startClient();
-        }
-      }
-
-      // Additional pupPage check
-      const hasValidPage = Boolean(client.pupPage);
-      if (!hasValidPage) {
-        log('warn', '⚠️ Watchdog: client missing pupPage. Restarting...');
-        
-        // Try to save session before restart
-        if (client.authStrategy) {
-          try {
-            log('info', '📥 Saving session before pupPage-triggered restart');
-            await safelyTriggerSessionSave(client);
-            log('info', '📥 Session saved before pupPage-triggered restart');
-          } catch (err) {
-            log('error', `Failed to save session before pupPage-triggered restart: ${err.message}`);
-          }
-        }
-        
-        await client.destroy().catch(err => 
-          log('error', `Error destroying client in watchdog: ${err.message}`)
-        );
-        client = null;
-        await startClient();
-        return;
-      }
-
-      if (state !== 'CONNECTED') {
-        log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
-        
-        // Try to save session before restart
-        if (client.authStrategy && state !== null) {
-          try {
-            log('info', '📥 Saving session before state-triggered restart');
-            await safelyTriggerSessionSave(client);
-            log('info', '📥 Session saved before state-triggered restart');
-          } catch (err) {
-            log('error', `Failed to save session before state-triggered restart: ${err.message}`);
-          }
-        }
-        
-        await client.destroy().catch(err => 
-          log('error', `Error destroying client in watchdog: ${err.message}`)
-        );
-        client = null;
-        await startClient();
-      }
-    } catch (err) {
-      log('error', `🚨 Watchdog error: ${err.message}. Restarting...`);
-      if (client) {
-        await client.destroy().catch(destroyErr => 
-          log('error', `Error destroying client after watchdog error: ${destroyErr.message}`)
-        );
-      }
-      client = null;
-      await startClient();
-    }
-  }, WATCHDOG_INTERVAL);
-});
-
-// Add any additional cleanup or shutdown handlers
-process.on('SIGTERM', async () => {
-  log('info', '📥 Received SIGTERM signal, saving session and shutting down');
-  if (client) {
-    try {
-      await safelyTriggerSessionSave(client);
-      await client.destroy();
-    } catch (err) {
-      log('error', `Error during shutdown: ${err.message}`);
-    }
-  }
-  process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-  log('info', '📥 Received SIGINT signal, saving session and shutting down');
-  if (client) {
-    try {
-      await safelyTriggerSessionSave(client);
-      await client.destroy();
-    } catch (err) {
-      log('error', `Error during shutdown: ${err.message}`);
-    }
-  }
-  process.exit(0);
-});
+      
+      // Start WhatsApp client
+      startClient();
+    });
+  });})
