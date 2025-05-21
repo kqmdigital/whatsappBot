@@ -1843,7 +1843,11 @@ app.post('/send-message', async (req, res) => {
   }
 
   if (!client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
+    return res.status(503).json({ 
+      success: false, 
+      error: 'WhatsApp client not ready',
+      message_id: null 
+    });
   }
   
   // Check browser health before adding to queue
@@ -1867,7 +1871,8 @@ app.post('/send-message', async (req, res) => {
     
     return res.status(503).json({ 
       success: false, 
-      error: 'WhatsApp browser needs to restart, please retry in 30 seconds' 
+      error: 'WhatsApp browser needs to restart, please retry in 30 seconds',
+      message_id: null 
     });
   }
   
@@ -1878,7 +1883,11 @@ app.post('/send-message', async (req, res) => {
       
       // Additional validation for image URL
       if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
-        return res.status(400).json({ success: false, error: 'Invalid imageUrl format - must begin with http:// or https://' });
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Invalid imageUrl format - must begin with http:// or https://',
+          message_id: null 
+        });
       }
       
       // Pre-check if image URL is accessible
@@ -1903,7 +1912,11 @@ app.post('/send-message', async (req, res) => {
         log('warn', `⚠️ Failed to pre-validate image URL: ${headErr.message}`);
       }
     } catch (err) {
-      return res.status(400).json({ success: false, error: 'Invalid imageUrl format' });
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid imageUrl format',
+        message_id: null 
+      });
     }
   }
   
@@ -1912,13 +1925,17 @@ app.post('/send-message', async (req, res) => {
     return res.status(429).json({ 
       success: false, 
       error: 'Message queue too long. Try again later.',
-      queueLength: messageQueue.length
+      queueLength: messageQueue.length,
+      message_id: null
     });
   }
   
-  // Create a Promise to get the messageId
-  let messageIdPromise = new Promise((resolve, reject) => {
-    // Add message to queue
+  // Wait for the message to be sent or max 30 seconds
+  const waitForMessageSent = new Promise((resolve) => {
+    // Set a flag to track if the response was sent
+    let responseSent = false;
+    
+    // Add message to queue with callback for when it's actually sent
     messageQueue.push({
       jid,
       message,
@@ -1929,15 +1946,59 @@ app.post('/send-message', async (req, res) => {
         // This will be called when the message is actually sent
         log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
         
-        if (result.success) {
-          resolve(result);
-        } else {
-          reject(result.error || 'Failed to send message');
+        if (!responseSent) {
+          responseSent = true;
+          if (result.success) {
+            resolve({
+              status: 200,
+              data: {
+                success: true,
+                message: 'Message sent successfully',
+                message_id: result.messageId,
+                messageId: result.messageId, // Including both formats for compatibility
+                timestamp: result.timestamp
+              }
+            });
+          } else {
+            resolve({
+              status: 500,
+              data: {
+                success: false,
+                error: result.error || 'Failed to send message',
+                message_id: null,
+                messageId: null
+              }
+            });
+          }
         }
       }
     });
     
     log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length})`);
+    
+    // Set a timeout for the max wait time (30 seconds)
+    setTimeout(() => {
+      if (!responseSent) {
+        responseSent = true;
+        resolve({
+          status: 202,
+          data: {
+            success: true,
+            message: 'Message added to queue, still processing',
+            queuePosition: messageQueue.findIndex(item => 
+              item.jid === jid && 
+              item.message === message && 
+              item.imageUrl === imageUrl
+            ) + 1,
+            queueLength: messageQueue.length,
+            estimated_send_time: `${(messageQueue.length * 2)} seconds`,
+            // Include a pending messageId placeholder so n8n can use it
+            message_id: `pending_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
+            messageId: `pending_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`
+          }
+        });
+      }
+    }, 30000); // 30 second timeout
   });
   
   // Start processing if not already running
@@ -1946,54 +2007,17 @@ app.post('/send-message', async (req, res) => {
   }
   
   try {
-    // Add a timeout for the response if the queue is long
-    const messageIdTimeout = setTimeout(() => {
-      if (!res.headersSent) {
-        return res.status(202).json({
-          success: true,
-          message: 'Message added to queue, processing in progress',
-          queuePosition: messageQueue.length,
-          queueLength: messageQueue.length,
-          estimated_send_time: `${(messageQueue.length * 2)} seconds`
-        });
-      }
-    }, 1500); // 1.5 second timeout
-
-    // Try to get messageId quickly (if queue is empty and processes right away)
-    messageIdPromise.then(result => {
-      clearTimeout(messageIdTimeout);
-      if (!res.headersSent) {
-        return res.status(200).json({
-          success: true,
-          message: 'Message sent successfully',
-          messageId: result.messageId,
-          timestamp: result.timestamp
-        });
-      }
-    }).catch(err => {
-      clearTimeout(messageIdTimeout);
-      if (!res.headersSent) {
-        // Still queued but not immediately processed
-        return res.status(202).json({
-          success: true,
-          message: 'Message added to queue',
-          queuePosition: messageQueue.length,
-          queueLength: messageQueue.length,
-          estimated_send_time: `${(messageQueue.length * 2)} seconds`
-        });
-      }
-    });
+    // Wait for message to be sent or timeout
+    const result = await waitForMessageSent;
+    return res.status(result.status).json(result.data);
   } catch (err) {
-    // Default response if Promise handling fails
-    if (!res.headersSent) {
-      return res.status(202).json({
-        success: true,
-        message: 'Message added to queue',
-        queuePosition: messageQueue.length,
-        queueLength: messageQueue.length,
-        estimated_send_time: `${(messageQueue.length * 2)} seconds`
-      });
-    }
+    // This should not happen with our promise setup, but just in case
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Unknown error occurred',
+      message_id: null,
+      messageId: null
+    });
   }
 });
 
