@@ -127,7 +127,7 @@ function updateSessionState(newState, details = {}) {
   }
 }
 
-// Enhanced function to extract session data from WhatsApp Web
+// Enhanced function to directly extract session data from WhatsApp Web
 async function extractSessionData(client) {
   if (!client || !client.pupPage) {
     log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
@@ -135,7 +135,7 @@ async function extractSessionData(client) {
   }
   
   try {
-    // Go directly for full localStorage extraction - simpler but effective
+    // Go directly for full localStorage extraction - most reliable based on logs
     const rawLocalStorage = await client.pupPage.evaluate(() => {
       try {
         const data = {};
@@ -152,76 +152,25 @@ async function extractSessionData(client) {
     
     if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
       log('info', `🔍 Extracted raw localStorage with ${Object.keys(rawLocalStorage).length} items`);
-      // Check if we have WhatsApp tokens
-      const hasWATokens = Object.keys(rawLocalStorage).some(key => 
-        key.includes('WAToken') || key.includes('WABrowserId') || 
-        key.includes('WASecretBundle') || key.includes('Model'));
       
-      if (hasWATokens) {
-        return rawLocalStorage;
+      // Check if this extraction actually has valuable data
+      const sessionSize = JSON.stringify(rawLocalStorage).length;
+      if (sessionSize < 1000) {
+        log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
+        return {
+          state: "CONNECTED",
+          timestamp: new Date().toISOString(),
+          fallback: true,
+          note: "Session data was too small"
+        };
       } else {
-        log('warn', 'localStorage extraction missed WhatsApp tokens');
+        return rawLocalStorage;
       }
     } else {
       log('warn', 'localStorage extraction found too few items');
     }
     
-    // Fallback to WhatsApp-web.js specific objects
-    const waWebData = await client.pupPage.evaluate(() => {
-      if (window.Store && window.Store.Conn) {
-        const conn = window.Store.Conn.serialize();
-        if (conn) return { conn, source: 'Store.Conn' };
-      }
-      return null;
-    });
-    
-    if (waWebData && Object.keys(waWebData).length > 2) {
-      log('info', '🔍 Extracted specific WhatsApp store data');
-      return waWebData;
-    }
-    
-    // Try to access WAWebJS internal data
-    try {
-      if (client._webVersion) {
-        // Try to capture some session info from the client itself
-        const clientInfo = {
-          webVersion: client._webVersion,
-          connected: client.info ? true : false,
-          state: client.state,
-          clientType: "WAWebJS"
-        };
-        
-        // Try to capture device ID if available
-        if (client._sessions && client._sessions.length > 0) {
-          clientInfo.sessions = client._sessions;
-        }
-        
-        return clientInfo;
-      }
-    } catch (e) {
-      log('warn', `Failed to extract internal client data: ${e.message}`);
-    }
-    
-    // Last resort - try to extract key WAWeb tokens
-    const waTokens = await client.pupPage.evaluate(() => {
-      const data = {};
-      const waTokens = ['WAToken1', 'WAToken2', 'WABrowserId', 'WASecretBundle'];
-      waTokens.forEach(key => {
-        try {
-          const val = window.localStorage.getItem(key);
-          if (val) data[key] = val;
-        } catch (e) {}
-      });
-      return Object.keys(data).length > 2 ? data : null;
-    });
-    
-    if (waTokens) {
-      log('info', '🔍 Extracted specific WA tokens only');
-      return waTokens;
-    }
-    
-    log('warn', '❓ All session data extraction methods failed');
-    // Return at least the state if nothing else works
+    // Fallback minimal valid session
     return {
       state: "CONNECTED",
       timestamp: new Date().toISOString(),
@@ -243,35 +192,40 @@ async function safelyTriggerSessionSave(client) {
   if (!client) return false;
   
   try {
-    // For enhanced LocalAuth, use the save method directly
-    if (client.authStrategy && typeof client.authStrategy.save === 'function') {
-      // Make sure client reference is set
-      if (client.authStrategy.client === null) {
-        client.authStrategy.client = client;
-        log('info', '🔗 Set client reference in auth strategy during save');
+    // Use direct localStorage extraction to get session data
+    const sessionData = await extractSessionData(client);
+    
+    if (sessionData) {
+      const sessionSize = JSON.stringify(sessionData).length;
+      log('info', `📥 Got session data to save (${sessionSize} bytes)`);
+      
+      if (sessionSize < 1000) {
+        log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
+        return false;
       }
       
-      // Try to get session data using our enhanced extractor
-      const sessionData = await extractSessionData(client);
-      
-      if (sessionData) {
-        const sessionSize = JSON.stringify(sessionData).length;
-        log('info', `📥 Got session data to save (${sessionSize} bytes)`);
+      // For enhanced LocalAuth, use the save method directly
+      if (client.authStrategy && typeof client.authStrategy.save === 'function') {
+        // Make sure client reference is set
+        if (client.authStrategy.client === null) {
+          client.authStrategy.client = client;
+          log('info', '🔗 Set client reference in auth strategy during save');
+        }
         
         await client.authStrategy.save(sessionData);
         log('info', '📥 Session save triggered with valid data');
         return true;
+      } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
+        // For RemoteAuth fallback
+        await client.authStrategy.requestSave();
+        log('info', '📥 Session save requested');
+        return true;
       } else {
-        log('warn', '❓ Could not find valid session data for saving');
+        log('info', '📥 Session will be saved automatically (no manual save available)');
         return false;
       }
-    } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
-      // For RemoteAuth fallback
-      await client.authStrategy.requestSave();
-      log('info', '📥 Session save requested');
-      return true;
     } else {
-      log('info', '📥 Session will be saved automatically (no manual save available)');
+      log('warn', '❓ Could not find valid session data for saving');
       return false;
     }
   } catch (err) {
@@ -354,7 +308,7 @@ class EnhancedLocalAuth extends LocalAuth {
       if (data?.session_data) {
         // Check if session data is valid
         const sessionSize = JSON.stringify(data.session_data).length;
-        if (sessionSize < 100) {
+        if (sessionSize < 1000) {
           log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
           return;
         }
@@ -384,23 +338,48 @@ class EnhancedLocalAuth extends LocalAuth {
   }
   
   async save(session) {
-    if (!session) {
-      log('warn', '⚠️ Attempting to save empty session');
+    // Check if session is valid and has sufficient data
+    if (!session || JSON.stringify(session).length < 1000) {
+      log('warn', '⚠️ Session data appears too small or invalid');
       
-      // Try to get session data using our enhanced extractor
-      const extractedSession = await extractSessionData(this.client);
-      
-      if (extractedSession) {
-        const sessionSize = JSON.stringify(extractedSession).length;
-        log('info', `🔍 Successfully extracted session data for saving (${sessionSize} bytes)`);
-        session = extractedSession;
+      // Skip trying all other methods and go straight to direct localStorage extraction
+      if (this.client && this.client.pupPage) {
+        try {
+          log('info', 'Attempting direct localStorage extraction as last resort');
+          const rawLocalStorage = await this.client.pupPage.evaluate(() => {
+            const data = {};
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              data[key] = localStorage.getItem(key);
+            }
+            return data;
+          });
+          
+          if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
+            session = rawLocalStorage;
+            const newSize = JSON.stringify(session).length;
+            log('info', `Found better session data via direct extraction (${newSize} bytes)`);
+            
+            // Only continue if the extracted data is valid
+            if (newSize < 1000) {
+              log('warn', `Extracted session still too small (${newSize} bytes), aborting save`);
+              return;
+            }
+          } else {
+            log('warn', 'Direct extraction found too few items, aborting save');
+            return;
+          }
+        } catch (e) {
+          log('error', `Last resort extraction failed: ${e.message}`);
+          return;
+        }
       } else {
-        log('warn', '❌ Still no valid session data found, cannot save');
+        log('warn', 'No client or pupPage available for extraction, aborting save');
         return;
       }
     }
     
-    // First save locally using the parent method - BUT ONLY IF IT'S VALID
+    // Save locally using the parent method if available
     try {
       if (typeof super.save === 'function') {
         await super.save(session);
@@ -434,30 +413,10 @@ class EnhancedLocalAuth extends LocalAuth {
       const sessionSize = JSON.stringify(session).length;
       log('info', `Saving session to Supabase (${sessionSize} bytes)`);
       
-      if (sessionSize < 100) {
-        log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
-        // Try a last-ditch effort to get real session data
-        if (this.client && this.client.pupPage) {
-          try {
-            log('info', 'Attempting direct localStorage extraction as last resort');
-            const rawLocalStorage = await this.client.pupPage.evaluate(() => {
-              const data = {};
-              for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                data[key] = localStorage.getItem(key);
-              }
-              return data;
-            });
-            
-            if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
-              session = rawLocalStorage;
-              const newSize = JSON.stringify(session).length;
-              log('info', `Found better session data via direct extraction (${newSize} bytes)`);
-            }
-          } catch (e) {
-            log('error', `Last resort extraction failed: ${e.message}`);
-          }
-        }
+      // One final check before saving to Supabase
+      if (sessionSize < 1000) {
+        log('warn', `Session is still too small (${sessionSize} bytes), skipping Supabase save`);
+        return;
       }
       
       const { error } = await this.supabase
@@ -1048,8 +1007,8 @@ async function checkSessionStatus() {
     const sessionDataSize = JSON.stringify(data.session_data).length;
     log('info', `✅ Found session in Supabase (${sessionDataSize} bytes)`);
     
-    // Session data less than 100 bytes is almost certainly invalid
-    if (sessionDataSize < 100) {
+    // Session data less than 1000 bytes is almost certainly invalid
+    if (sessionDataSize < 1000) {
       log('warn', '⚠️ Session data appears to be too small, might be invalid');
       await clearInvalidSession();
       return false;
