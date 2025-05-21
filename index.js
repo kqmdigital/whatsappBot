@@ -1493,13 +1493,31 @@ async function processMessageQueue() {
             caption: message || '',
             ...options
           });
-          log('info', `📤 Media message sent successfully with ID: ${sentMessage.id._serialized}`);
+          
+          const rawMessageId = sentMessage.id._serialized;
+          log('info', `📤 Media message sent successfully with ID: ${rawMessageId}`);
+          
+          callback({ 
+            success: true, 
+            messageId: rawMessageId,
+            message_id: rawMessageId,
+            timestamp: new Date().toISOString()
+          });
         } catch (mediaErr) {
           log('error', `Media download/send failed: ${mediaErr.message}`);
           
           // Fallback to text-only if media sending fails
           log('info', '📤 Falling back to text-only message');
           sentMessage = await client.sendMessage(jid, `${message || ''}\n\n[Media could not be sent: ${imageUrl}]`);
+          
+          const rawMessageId = sentMessage.id._serialized;
+          
+          callback({ 
+            success: true, 
+            messageId: rawMessageId,
+            message_id: rawMessageId, 
+            timestamp: new Date().toISOString()
+          });
         }
       } catch (err) {
         log('error', `Failed to process media: ${err.message}`);
@@ -1508,8 +1526,22 @@ async function processMessageQueue() {
         try {
           log('info', '📤 Sending fallback text message without media');
           sentMessage = await client.sendMessage(jid, `${message || ''}\n\n[Media could not be processed: ${imageUrl}]`);
+          
+          const rawMessageId = sentMessage.id._serialized;
+          
+          callback({ 
+            success: true, 
+            messageId: rawMessageId,
+            message_id: rawMessageId, 
+            timestamp: new Date().toISOString()
+          });
         } catch (textErr) {
-          return callback({ success: false, error: `Failed to send even fallback message: ${textErr.message}` });
+          return callback({ 
+            success: false, 
+            error: `Failed to send even fallback message: ${textErr.message}`,
+            messageId: null,
+            message_id: null
+          });
         }
       }
     } else {
@@ -1536,7 +1568,22 @@ async function processMessageQueue() {
         // Send the actual message
         log('info', '📤 Sending text message...');
         sentMessage = await client.sendMessage(jid, message, options);
-        log('info', `📤 Text message sent successfully with ID: ${sentMessage.id._serialized}`);
+        
+        const rawMessageId = sentMessage.id._serialized;
+        log('info', `📤 Text message sent successfully with ID: ${rawMessageId}`);
+        
+        // Update activity time
+        lastActivityTime = Date.now();
+        messagesSentLastHour++;
+        
+        callback({ 
+          success: true, 
+          messageId: rawMessageId,
+          message_id: rawMessageId, 
+          timestamp: new Date().toISOString()
+        });
+        
+        log('info', `✉️ Message sent from queue (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR} this hour, ${messageQueue.length} remaining)`);
       } catch (err) {
         // Retry once with a simpler approach if the first attempt fails
         log('warn', `Message send failed: ${err.message}. Retrying without typing simulation...`);
@@ -1545,28 +1592,35 @@ async function processMessageQueue() {
           // Simple retry without typing simulation
           await new Promise(resolve => setTimeout(resolve, 1000));
           sentMessage = await client.sendMessage(jid, message, options);
+          
+          const rawMessageId = sentMessage.id._serialized;
+          
+          callback({ 
+            success: true, 
+            messageId: rawMessageId,
+            message_id: rawMessageId, 
+            timestamp: new Date().toISOString()
+          });
         } catch (retryErr) {
-          return callback({ success: false, error: `Failed to send message after retry: ${retryErr.message}` });
+          return callback({ 
+            success: false, 
+            error: `Failed to send message after retry: ${retryErr.message}`,
+            messageId: null,
+            message_id: null
+          });
         }
       }
     }
-    
-    // Update activity time
-    lastActivityTime = Date.now();
-    messagesSentLastHour++;
-    
-    log('info', `✉️ Message sent from queue (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR} this hour, ${messageQueue.length} remaining)`);
-    
-    callback({ 
-      success: true, 
-      messageId: sentMessage.id._serialized,
-      timestamp: new Date().toISOString()
-    });
   } catch (err) {
     log('error', `Error processing message from queue: ${err.message}`);
     if (messageQueue.length > 0) {
       const task = messageQueue[0];
-      task.callback({ success: false, error: err.message });
+      task.callback({ 
+        success: false, 
+        error: err.message,
+        messageId: null,
+        message_id: null
+      });
       messageQueue.shift();
     }
   } finally {
@@ -1578,6 +1632,8 @@ async function processMessageQueue() {
     }
   }
 }
+
+// We'll no longer normalize message IDs - we'll use the raw WhatsApp IDs
 
 // Enhanced Express server with basic security
 const app = express();
@@ -1843,11 +1899,7 @@ app.post('/send-message', async (req, res) => {
   }
 
   if (!client) {
-    return res.status(503).json({ 
-      success: false, 
-      error: 'WhatsApp client not ready',
-      message_id: null 
-    });
+    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
   }
   
   // Check browser health before adding to queue
@@ -1871,8 +1923,7 @@ app.post('/send-message', async (req, res) => {
     
     return res.status(503).json({ 
       success: false, 
-      error: 'WhatsApp browser needs to restart, please retry in 30 seconds',
-      message_id: null 
+      error: 'WhatsApp browser needs to restart, please retry in 30 seconds'
     });
   }
   
@@ -1883,11 +1934,7 @@ app.post('/send-message', async (req, res) => {
       
       // Additional validation for image URL
       if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Invalid imageUrl format - must begin with http:// or https://',
-          message_id: null 
-        });
+        return res.status(400).json({ success: false, error: 'Invalid imageUrl format - must begin with http:// or https://' });
       }
       
       // Pre-check if image URL is accessible
@@ -1912,11 +1959,7 @@ app.post('/send-message', async (req, res) => {
         log('warn', `⚠️ Failed to pre-validate image URL: ${headErr.message}`);
       }
     } catch (err) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid imageUrl format',
-        message_id: null 
-      });
+      return res.status(400).json({ success: false, error: 'Invalid imageUrl format' });
     }
   }
   
@@ -1925,98 +1968,53 @@ app.post('/send-message', async (req, res) => {
     return res.status(429).json({ 
       success: false, 
       error: 'Message queue too long. Try again later.',
-      queueLength: messageQueue.length,
-      message_id: null
+      queueLength: messageQueue.length
     });
   }
-  
-  // Wait for the message to be sent or max 30 seconds
-  const waitForMessageSent = new Promise((resolve) => {
-    // Set a flag to track if the response was sent
-    let responseSent = false;
-    
-    // Add message to queue with callback for when it's actually sent
-    messageQueue.push({
-      jid,
-      message,
-      imageUrl,
-      options,
-      addedAt: Date.now(),
-      callback: (result) => {
-        // This will be called when the message is actually sent
-        log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
-        
-        if (!responseSent) {
-          responseSent = true;
+
+  // Wait for the message to be sent and get the real WhatsApp message ID
+  try {
+    // Create a promise that resolves when we get the real message ID
+    const messageResult = await new Promise((resolve, reject) => {
+      // Add message to queue
+      messageQueue.push({
+        jid,
+        message,
+        imageUrl,
+        options,
+        addedAt: Date.now(),
+        callback: (result) => {
+          // This will be called when the message is actually sent
+          log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
+          
           if (result.success) {
-            resolve({
-              status: 200,
-              data: {
-                success: true,
-                message: 'Message sent successfully',
-                message_id: result.messageId,
-                messageId: result.messageId, // Including both formats for compatibility
-                timestamp: result.timestamp
-              }
-            });
+            resolve(result);
           } else {
-            resolve({
-              status: 500,
-              data: {
-                success: false,
-                error: result.error || 'Failed to send message',
-                message_id: null,
-                messageId: null
-              }
-            });
+            reject(new Error(result.error || 'Failed to send message'));
           }
         }
+      });
+      
+      log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length})`);
+      
+      // Start processing if not already running
+      if (!isProcessingQueue) {
+        processMessageQueue();
       }
     });
     
-    log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length})`);
-    
-    // Set a timeout for the max wait time (30 seconds)
-    setTimeout(() => {
-      if (!responseSent) {
-        responseSent = true;
-        resolve({
-          status: 202,
-          data: {
-            success: true,
-            message: 'Message added to queue, still processing',
-            queuePosition: messageQueue.findIndex(item => 
-              item.jid === jid && 
-              item.message === message && 
-              item.imageUrl === imageUrl
-            ) + 1,
-            queueLength: messageQueue.length,
-            estimated_send_time: `${(messageQueue.length * 2)} seconds`,
-            // Include a pending messageId placeholder so n8n can use it
-            message_id: `pending_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`,
-            messageId: `pending_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`
-          }
-        });
-      }
-    }, 30000); // 30 second timeout
-  });
-  
-  // Start processing if not already running
-  if (!isProcessingQueue) {
-    processMessageQueue();
-  }
-  
-  try {
-    // Wait for message to be sent or timeout
-    const result = await waitForMessageSent;
-    return res.status(result.status).json(result.data);
+    // When we get here, the message has been sent and we have the real ID
+    return res.status(200).json({
+      success: true,
+      message: 'Message sent successfully',
+      messageId: messageResult.messageId,
+      timestamp: messageResult.timestamp
+    });
   } catch (err) {
-    // This should not happen with our promise setup, but just in case
+    // If anything goes wrong, return an error
     return res.status(500).json({
       success: false,
-      error: err.message || 'Unknown error occurred',
-      message_id: null,
-      messageId: null
+      error: err.message || 'Failed to send message'
     });
   }
 });
@@ -2394,4 +2392,37 @@ const server = app.listen(PORT, () => {
       // Start WhatsApp client
       startClient();
     });
-  });})
+  });
+});
+
+// Set up watchdog timer to detect and fix connection issues
+setInterval(async () => {
+  // Skip if no client exists
+  if (!client) return;
+  
+  // Check browser health
+  const isBrowserHealthy = await checkBrowserHealth(client);
+  
+  if (!isBrowserHealthy) {
+    log('warn', '⚠️ Watchdog detected unhealthy browser state, initiating restart');
+    
+    // Try to save session before restart
+    if (client.authStrategy) {
+      try {
+        await safelyTriggerSessionSave(client);
+        log('info', '📥 Session saved before watchdog restart');
+      } catch (err) {
+        log('error', `Failed to save session before watchdog restart: ${err.message}`);
+      }
+    }
+    
+    // Destroy and restart client
+    try {
+      await client.destroy();
+    } catch (err) {
+      log('error', `Error during watchdog client destroy: ${err.message}`);
+    } finally {
+      client = null;
+      setTimeout(startClient, 5000);
+    }
+    return;}})
