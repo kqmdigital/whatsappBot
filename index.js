@@ -2425,6 +2425,64 @@ app.get('/ping', (_, res) => {
   res.status(200).send('pong');
 });
 
+// Add this new cleanup endpoint right after your other endpoints
+app.post('/cleanup-all-sessions', async (req, res) => {
+  try {
+    log('info', '🧹 Performing complete session cleanup...');
+    
+    // Delete from Supabase - all sessions including backups
+    const { error: deleteError } = await supabase
+      .from('whatsapp_sessions')
+      .delete()
+      .filter('session_key', 'like', `%${SESSION_ID}%`);
+    
+    if (deleteError) {
+      log('error', `Failed to delete sessions from Supabase: ${deleteError.message}`);
+    } else {
+      log('info', '✅ All sessions deleted from Supabase');
+    }
+    
+    // Clear local session files
+    const sessionDir = path.join(__dirname, `.wwebjs_auth`);
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      log('info', '✅ Local session directory removed');
+    } else {
+      log('info', 'No local session directory found');
+    }
+    
+    // Destroy client if it exists
+    if (client) {
+      try {
+        await client.destroy();
+        log('info', '✅ WhatsApp client destroyed');
+      } catch (destroyErr) {
+        log('error', `Error destroying client: ${destroyErr.message}`);
+      } finally {
+        client = null;
+      }
+    }
+    
+    // Reset state variables
+    currentQRCode = null;
+    connectionRetryCount = 0;
+    isClientInitializing = false;
+    updateSessionState(SESSION_STATES.INITIALIZING);
+    
+    // Response to the API caller
+    res.status(200).json({ 
+      success: true, 
+      message: 'All sessions cleared and client reset',
+      restart: 'Client will restart automatically in 5 seconds'
+    });
+    
+    // Restart client after a delay
+    setTimeout(startClient, 5000);
+  } catch (err) {
+    log('error', `Session cleanup failed: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 // Start server and initialize client
 const server = app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
