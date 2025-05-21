@@ -870,6 +870,7 @@ async function handleIncomingMessage(msg) {
           message_id: quoted.id._serialized || null,
           text: quoted?.body || null,
         };
+        log('info', `📝 Message ${messageId} is replying to message ${replyInfo.message_id}`);
       }
     } catch (err) {
       log('warn', `⚠️ Failed to get quoted message: ${err.message}`);
@@ -945,7 +946,7 @@ async function handleIncomingMessage(msg) {
   }
 }
 
-// Improved webhook sender with webhook type parameter
+// Improved webhook sender with webhook type parameter and messageId tracking
 async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
   if (!webhookUrl) {
     log('warn', `⚠️ ${webhookType} webhook URL not set. Webhook skipped.`);
@@ -962,6 +963,18 @@ async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
 
   // Add webhook type to payload
   payload.webhookType = webhookType;
+  
+  // Ensure message IDs are clearly labeled
+  if (payload.messageId) {
+    // Save original message ID format
+    payload.whatsapp_messageId = payload.messageId;
+    
+    // If this is a reply, create a clear relationship
+    if (payload.hasReply && payload.replyInfo && payload.replyInfo.message_id) {
+      payload.replying_to_messageId = payload.replyInfo.message_id;
+      log('info', `📝 Linking message ${payload.messageId} to original message ${payload.replying_to_messageId}`);
+    }
+  }
 
   // Estimate payload size
   const payloadSize = Buffer.byteLength(JSON.stringify(payload), 'utf8');
@@ -1273,7 +1286,7 @@ async function processMessageQueue() {
             caption: message || '',
             ...options
           });
-          log('info', '📤 Media message sent successfully');
+          log('info', `📤 Media message sent successfully with ID: ${sentMessage.id._serialized}`);
         } catch (mediaErr) {
           log('error', `Media download/send failed: ${mediaErr.message}`);
           
@@ -1316,7 +1329,7 @@ async function processMessageQueue() {
         // Send the actual message
         log('info', '📤 Sending text message...');
         sentMessage = await client.sendMessage(jid, message, options);
-        log('info', '📤 Text message sent successfully');
+        log('info', `📤 Text message sent successfully with ID: ${sentMessage.id._serialized}`);
       } catch (err) {
         // Retry once with a simpler approach if the first attempt fails
         log('warn', `Message send failed: ${err.message}. Retrying without typing simulation...`);
@@ -1535,10 +1548,66 @@ app.get('/session', async (req, res) => {
   }
 });
 
+// Message status tracking endpoint
+app.get('/message/:messageId', async (req, res) => {
+  try {
+    const messageId = req.params.messageId;
+    
+    if (!messageId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing messageId parameter'
+      });
+    }
+    
+    if (!client) {
+      return res.status(503).json({
+        success: false,
+        error: 'WhatsApp client not ready'
+      });
+    }
+    
+    try {
+      // Try to get message status
+      const message = await client.getMessageById(messageId);
+      
+      if (!message) {
+        return res.status(404).json({
+          success: false,
+          error: 'Message not found'
+        });
+      }
+      
+      return res.status(200).json({
+        success: true,
+        messageId: messageId,
+        status: message.ack || 0, // 0: pending, 1: received, 2: viewed, 3: played (for audio/video)
+        timestamp: new Date(message.timestamp * 1000).toISOString(),
+        from: message.from,
+        to: message.to,
+        hasMedia: Boolean(message.hasMedia),
+        body: message.body,
+        quotedMsgId: message._data?.quotedStanzaID || null
+      });
+      
+    } catch (err) {
+      return res.status(404).json({
+        success: false,
+        error: `Failed to get message status: ${err.message}`
+      });
+    }
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
 // Start queue processor
 setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
 
-// Enhanced message sending endpoint with queue
+// Enhanced message sending endpoint with queue and messageId tracking
 app.post('/send-message', async (req, res) => {
   // Accept either jid or groupId parameter
   const jid = req.body.jid || req.body.groupId;
@@ -1606,22 +1675,28 @@ app.post('/send-message', async (req, res) => {
     });
   }
   
-  // Add message to queue
-  const id = `${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-  
-  log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length + 1})`);
-  
-  // Add to queue and respond immediately
-  messageQueue.push({
-    jid,
-    message,
-    imageUrl,
-    options,
-    addedAt: Date.now(),
-    callback: (result) => {
-      // This will be called when the message is actually sent
-      log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
-    }
+  // Create a Promise to get the messageId
+  let messageIdPromise = new Promise((resolve, reject) => {
+    // Add message to queue
+    messageQueue.push({
+      jid,
+      message,
+      imageUrl,
+      options,
+      addedAt: Date.now(),
+      callback: (result) => {
+        // This will be called when the message is actually sent
+        log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
+        
+        if (result.success) {
+          resolve(result);
+        } else {
+          reject(result.error || 'Failed to send message');
+        }
+      }
+    });
+    
+    log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length})`);
   });
   
   // Start processing if not already running
@@ -1629,14 +1704,56 @@ app.post('/send-message', async (req, res) => {
     processMessageQueue();
   }
   
-  // Respond immediately
-  return res.status(202).json({
-    success: true,
-    message: 'Message added to queue',
-    queuePosition: messageQueue.length,
-    queueLength: messageQueue.length,
-    estimated_send_time: `${(messageQueue.length * 2)} seconds`
-  });
+  try {
+    // Add a timeout for the response if the queue is long
+    const messageIdTimeout = setTimeout(() => {
+      if (!res.headersSent) {
+        return res.status(202).json({
+          success: true,
+          message: 'Message added to queue, processing in progress',
+          queuePosition: messageQueue.length,
+          queueLength: messageQueue.length,
+          estimated_send_time: `${(messageQueue.length * 2)} seconds`
+        });
+      }
+    }, 1500); // 1.5 second timeout
+
+    // Try to get messageId quickly (if queue is empty and processes right away)
+    messageIdPromise.then(result => {
+      clearTimeout(messageIdTimeout);
+      if (!res.headersSent) {
+        return res.status(200).json({
+          success: true,
+          message: 'Message sent successfully',
+          messageId: result.messageId,
+          timestamp: result.timestamp
+        });
+      }
+    }).catch(err => {
+      clearTimeout(messageIdTimeout);
+      if (!res.headersSent) {
+        // Still queued but not immediately processed
+        return res.status(202).json({
+          success: true,
+          message: 'Message added to queue',
+          queuePosition: messageQueue.length,
+          queueLength: messageQueue.length,
+          estimated_send_time: `${(messageQueue.length * 2)} seconds`
+        });
+      }
+    });
+  } catch (err) {
+    // Default response if Promise handling fails
+    if (!res.headersSent) {
+      return res.status(202).json({
+        success: true,
+        message: 'Message added to queue',
+        queuePosition: messageQueue.length,
+        queueLength: messageQueue.length,
+        estimated_send_time: `${(messageQueue.length * 2)} seconds`
+      });
+    }
+  }
 });
 
 // Get client status endpoint (enhanced)
