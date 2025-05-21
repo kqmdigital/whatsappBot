@@ -116,14 +116,18 @@ function updateSessionState(newState, details = {}) {
   // Take actions based on state transitions
   if (newState === SESSION_STATES.AUTHENTICATED) {
     // Force immediate session save on authentication
-    setTimeout(() => safelyTriggerSessionSave(client), 2000);
+    if (client && client.authStrategy) {
+      setTimeout(() => safelyTriggerSessionSave(client), 2000);
+    }
   }
   
   if (newState === SESSION_STATES.DISCONNECTED) {
     // Try to save session before disconnect
-    safelyTriggerSessionSave(client).catch(err => 
-      log('error', `Failed to save session on disconnect: ${err.message}`)
-    );
+    if (client && client.authStrategy) {
+      safelyTriggerSessionSave(client).catch(err => 
+        log('error', `Failed to save session on disconnect: ${err.message}`)
+      );
+    }
   }
 }
 
@@ -206,7 +210,10 @@ async function extractSessionData(client) {
 }
 
 async function safelyTriggerSessionSave(client) {
-  if (!client) return false;
+  if (!client || !client.pupPage) {
+    log('warn', '⚠️ Cannot save session: Client or pupPage not available');
+    return false;
+  }
   
   try {
     // Use direct localStorage extraction to get session data
@@ -583,6 +590,8 @@ let lastBrowserReset = Date.now(); // New variable to track browser resets
 
 // Function to detect if using a business number
 async function detectBusinessAccount(client) {
+  if (!client) return false;
+  
   try {
     // Check if business profile function exists
     if (typeof client.getBusinessProfile !== 'function') {
@@ -603,6 +612,8 @@ async function detectBusinessAccount(client) {
 
 // Apply specific optimizations for business accounts
 function applyBusinessOptimizations(client) {
+  if (!client) return;
+  
   log('info', '🔧 Applying business account optimizations...');
   
   // Shorter keepalive intervals for business accounts
@@ -780,6 +791,10 @@ async function checkBrowserHealth(client) {
 
 // New function to periodically reset browser to prevent memory leaks and crashes
 async function performPeriodicBrowserReset() {
+  if (!client || isClientInitializing) {
+    return false;
+  }
+  
   const BROWSER_RESET_INTERVAL = 8 * 60 * 60 * 1000; // 8 hours
   const now = Date.now();
   
@@ -820,6 +835,8 @@ async function performPeriodicBrowserReset() {
 }
 
 function setupClientEvents(c) {
+  if (!c) return;
+  
   c.on('qr', qr => {
     // Update session state
     updateSessionState(SESSION_STATES.WAITING_FOR_QR);
@@ -2396,33 +2413,102 @@ const server = app.listen(PORT, () => {
 });
 
 // Set up watchdog timer to detect and fix connection issues
+// IMPORTANT: Delay watchdog initialization to prevent it from running too early
+let watchdogInitialized = false;
+setTimeout(() => {
+  watchdogInitialized = true;
+  log('info', '🔍 Watchdog timer initialized and active');
+}, 60000); // Wait 1 minute before enabling watchdog
+
 setInterval(async () => {
+  // Skip if watchdog hasn't been initialized yet or during client initialization
+  if (!watchdogInitialized || isClientInitializing) {
+    return;
+  }
+  
   // Skip if no client exists
-  if (!client) return;
+  if (!client) {
+    return;
+  }
   
-  // Check browser health
-  const isBrowserHealthy = await checkBrowserHealth(client);
+  // Only check browser health if puppeteer page and browser exist
+  if (client.pupPage && client.pupBrowser) {
+    try {
+      const isBrowserHealthy = await checkBrowserHealth(client);
+      
+      if (!isBrowserHealthy) {
+        log('warn', '⚠️ Watchdog detected unhealthy browser state, initiating restart');
+        
+        // Try to save session before restart
+        if (client.authStrategy) {
+          try {
+            await safelyTriggerSessionSave(client);
+            log('info', '📥 Session saved before watchdog restart');
+          } catch (err) {
+            log('error', `Failed to save session before watchdog restart: ${err.message}`);
+          }
+        }
+        
+        // Destroy and restart client
+        try {
+          await client.destroy();
+        } catch (err) {
+          log('error', `Error during watchdog client destroy: ${err.message}`);
+        } finally {
+          client = null;
+          setTimeout(startClient, 5000);
+        }
+        return;
+      }
+    } catch (err) {
+      log('error', `Watchdog browser health check error: ${err.message}`);
+      // Continue with other checks even if browser health check fails
+    }
+  }
   
-  if (!isBrowserHealthy) {
-    log('warn', '⚠️ Watchdog detected unhealthy browser state, initiating restart');
+  // Check for inactivity
+  const inactiveTime = Date.now() - lastActivityTime;
+  if (inactiveTime > 30 * 60 * 1000) { // 30 minutes of inactivity
+    log('warn', `⚠️ Watchdog detected ${Math.floor(inactiveTime/60000)} minutes of inactivity, checking connection`);
     
-    // Try to save session before restart
-    if (client.authStrategy) {
+    try {
+      // Force a state check to verify connection
+      const state = await client.getState();
+      log('info', `Connection check: state is ${state}`);
+      
+      // Update activity time
+      lastActivityTime = Date.now();
+    } catch (err) {
+      log('error', `Watchdog connection check failed: ${err.message}`);
+      
+      // Try to save session before restart
+      if (client.authStrategy) {
+        try {
+          await safelyTriggerSessionSave(client);
+        } catch (saveErr) {
+          log('error', `Failed to save session during watchdog restart: ${saveErr.message}`);
+        }
+      }
+      
+      // Destroy and restart client
       try {
-        await safelyTriggerSessionSave(client);
-        log('info', '📥 Session saved before watchdog restart');
-      } catch (err) {
-        log('error', `Failed to save session before watchdog restart: ${err.message}`);
+        await client.destroy();
+      } catch (destroyErr) {
+        log('error', `Error during watchdog client destroy: ${destroyErr.message}`);
+      } finally {
+        client = null;
+        setTimeout(startClient, 5000);
       }
     }
-    
-    // Destroy and restart client
+  }
+  
+  // Perform periodic browser reset if needed
+  if (!isClientInitializing && client) {
     try {
-      await client.destroy();
+      await performPeriodicBrowserReset();
     } catch (err) {
-      log('error', `Error during watchdog client destroy: ${err.message}`);
-    } finally {
-      client = null;
-      setTimeout(startClient, 5000);
+      log('error', `Periodic browser reset error: ${err.message}`);
     }
-    return;}})
+  }
+  
+}, WATCHDOG_INTERVAL);
