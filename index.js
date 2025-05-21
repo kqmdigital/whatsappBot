@@ -664,17 +664,17 @@ function createWhatsAppClient() {
         '--disable-extensions',
         '--window-size=1280,720', // Larger viewport helps with business number UI
         '--disable-features=site-per-process',
-        '--js-flags="--max-old-space-size=300"', // Reduced memory limit from 350 to 300
+        '--js-flags="--max-old-space-size=512"', // Increased from 300 to 512
         '--disable-web-security',
         '--disable-features=IsolateOrigins,site-per-process',
         '--disable-site-isolation-trials',
-        '--single-process', // Add single-process mode to reduce memory usage
+        // Removed --single-process flag as it can cause stability issues
         '--disable-breakpad', // Disable crash reporting
         '--disable-component-extensions-with-background-pages', // Reduce memory usage
       ],
       defaultViewport: null, // Allow responsive viewport
-      timeout: 120000, // Reduced from 180000 to 120000 (2 minutes)
-      protocolTimeout: 60000, // Reduced from 90000 to 60000 (1 minute)
+      timeout: 180000, // Increased from 120000 to 180000 (3 minutes)
+      protocolTimeout: 90000, // Increased from 60000 to 90000 (1.5 minutes)
       handleSIGINT: false, // Don't let Puppeteer handle SIGINT, we'll do it ourselves
       handleSIGTERM: false, // Don't let Puppeteer handle SIGTERM, we'll do it ourselves
       handleSIGHUP: false, // Don't let Puppeteer handle SIGHUP, we'll do it ourselves
@@ -761,6 +761,21 @@ async function checkBrowserHealth(client) {
     return false;
   }
   
+  // If client was just initialized, give it more time to load properly
+  const timeSinceInit = Date.now() - lastActivityTime;
+  if (timeSinceInit < 5 * 60 * 1000) { // 5 minute grace period after initialization
+    try {
+      // Only check if page is responsive during grace period, not if WhatsApp Web is loaded
+      const isPageResponsive = await client.pupPage.evaluate(() => true).catch(() => false);
+      if (isPageResponsive) {
+        return true; // Consider healthy if page is responsive during grace period
+      }
+    } catch (err) {
+      log('warn', `Basic page check failed during grace period: ${err.message}`);
+      return false;
+    }
+  }
+  
   try {
     // Check if page is responsive (most important check)
     const isPageResponsive = await client.pupPage.evaluate(() => true).catch(() => false);
@@ -776,11 +791,15 @@ async function checkBrowserHealth(client) {
     
     if (!isWAWebLoaded) {
       log('warn', '⚠️ WhatsApp Web is not properly loaded');
+      
+      // Check if we're in QR code phase - this is still considered "healthy"
+      if (currentQRCode !== null) {
+        log('info', '🔍 QR code is active, considering browser healthy');
+        return true; // QR code state is normal and healthy
+      }
+      
       return false;
     }
-    
-    // Skip browser process check as it's causing issues
-    // client.pupBrowser.process() doesn't return a promise
     
     return true;
   } catch (err) {
@@ -850,6 +869,9 @@ function setupClientEvents(c) {
     
     // Reset connection retry count when we get a QR code
     connectionRetryCount = 0;
+    
+    // Reset activity time to prevent watchdog from restarting during QR scan
+    lastActivityTime = Date.now();
   });
 
   c.on('ready', async () => {
@@ -878,6 +900,9 @@ function setupClientEvents(c) {
       log('warn', `Failed to detect account type: ${err.message}`);
     }
     
+    // Reset activity time
+    lastActivityTime = Date.now();
+    
     // Force garbage collection if available
     if (global.gc) {
       log('info', '🧹 Running garbage collection');
@@ -889,6 +914,9 @@ function setupClientEvents(c) {
     log('info', '🔐 Client authenticated.');
     updateSessionState(SESSION_STATES.AUTHENTICATED);
     currentQRCode = null; // Clear QR code once authenticated
+    
+    // Reset activity time
+    lastActivityTime = Date.now();
     
     // Try to save session immediately after authentication
     setTimeout(async () => {
@@ -965,6 +993,9 @@ function setupClientEvents(c) {
     if (percent === 0 || percent === 100 || percent % 25 === 0) {
       log('info', `Loading: ${percent}% - ${message}`);
     }
+    
+    // Reset activity time on loading updates
+    lastActivityTime = Date.now();
   });
   
   c.on('change_state', state => {
@@ -1370,6 +1401,9 @@ async function startClient() {
     // Add a delay before initialization to ensure session files are properly set up
     await new Promise(resolve => setTimeout(resolve, 5000));
     log('info', '🚀 Starting client initialization');
+    
+    // Reset activity time
+    lastActivityTime = Date.now();
     
     // Add timeout guard for initialization
     const initPromise = client.initialize();
@@ -2418,7 +2452,7 @@ let watchdogInitialized = false;
 setTimeout(() => {
   watchdogInitialized = true;
   log('info', '🔍 Watchdog timer initialized and active');
-}, 60000); // Wait 1 minute before enabling watchdog
+}, 180000); // Wait 3 minutes before enabling watchdog
 
 setInterval(async () => {
   // Skip if watchdog hasn't been initialized yet or during client initialization
@@ -2512,3 +2546,133 @@ setInterval(async () => {
   }
   
 }, WATCHDOG_INTERVAL);
+
+// Process cleanup on exit
+process.on('SIGTERM', async () => {
+  log('info', '🛑 SIGTERM received, shutting down gracefully');
+  
+  // Try to save session before exit
+  if (client && client.authStrategy) {
+    try {
+      await safelyTriggerSessionSave(client);
+      log('info', '📥 Session saved before exit');
+    } catch (err) {
+      log('error', `Failed to save session before exit: ${err.message}`);
+    }
+  }
+  
+  // Destroy client if it exists
+  if (client) {
+    try {
+      await client.destroy();
+      log('info', '🧹 Client destroyed during shutdown');
+    } catch (err) {
+      log('error', `Error destroying client during shutdown: ${err.message}`);
+    } finally {
+      client = null;
+    }
+  }
+  
+  // Close server
+  server.close(() => {
+    log('info', '👋 Server closed, exiting process');
+    process.exit(0);
+  });
+  
+  // Force exit after timeout
+  setTimeout(() => {
+    log('info', '⏱️ Force exit after timeout');
+    process.exit(1);
+  }, 10000);
+});
+
+// Handle SIGINT (Ctrl+C)
+process.on('SIGINT', async () => {
+  log('info', '🛑 SIGINT received, shutting down gracefully');
+  
+  // Try to save session before exit
+  if (client && client.authStrategy) {
+    try {
+      await safelyTriggerSessionSave(client);
+      log('info', '📥 Session saved before exit');
+    } catch (err) {
+      log('error', `Failed to save session before exit: ${err.message}`);
+    }
+  }
+  
+  // Destroy client if it exists
+  if (client) {
+    try {
+      await client.destroy();
+      log('info', '🧹 Client destroyed during shutdown');
+    } catch (err) {
+      log('error', `Error destroying client during shutdown: ${err.message}`);
+    } finally {
+      client = null;
+    }
+  }
+  
+  // Close server
+  server.close(() => {
+    log('info', '👋 Server closed, exiting process');
+    process.exit(0);
+  });
+  
+  // Force exit after timeout
+  setTimeout(() => {
+    log('info', '⏱️ Force exit after timeout');
+    process.exit(1);
+  }, 10000);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  log('error', `💥 Uncaught exception: ${err.message}`);
+  log('error', err.stack);
+  // Continue running - don't exit
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  log('error', `🔥 Unhandled promise rejection: ${reason}`);
+  // Continue running - don't exit
+});
+
+// Add self-ping to prevent Render from sleeping
+if (process.env.SELF_PING_URL) {
+  const PING_INTERVAL = parseInt(process.env.SELF_PING_INTERVAL || '300000'); // 5 minutes by default
+  
+  log('info', `📡 Self-ping enabled, will ping ${process.env.SELF_PING_URL} every ${PING_INTERVAL/60000} minutes`);
+  
+  setInterval(async () => {
+    try {
+      log.debug(`🏓 Self-ping: ${process.env.SELF_PING_URL}`);
+      await axios.get(process.env.SELF_PING_URL, { timeout: 5000 });
+    } catch (err) {
+      log('warn', `Self-ping failed: ${err.message}`);
+    }
+  }, PING_INTERVAL);
+}
+
+// Set memory monitoring interval
+if (global.gc) {
+  // If garbage collection is exposed, monitor memory and trigger GC when needed
+  setInterval(() => {
+    const mem = process.memoryUsage();
+    const rssMB = Math.round(mem.rss / 1024 / 1024);
+    
+    if (rssMB > MEMORY_THRESHOLD_MB) {
+      log('warn', `Memory usage high (${rssMB}MB), running garbage collection`);
+      global.gc();
+      
+      // Log memory after GC
+      setTimeout(() => {
+        const memAfter = process.memoryUsage();
+        const rssMBAfter = Math.round(memAfter.rss / 1024 / 1024);
+        log('info', `Memory after GC: ${rssMBAfter}MB (reduced by ${rssMB - rssMBAfter}MB)`);
+      }, 1000);
+    }
+  }, 60000); // Check every minute
+}
+
+log('info', '✅ Application bootstrap completed, waiting for events...');
