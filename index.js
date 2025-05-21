@@ -201,7 +201,7 @@ async function safelyTriggerSessionSave(client) {
       const sessionSize = JSON.stringify(sessionData).length;
       log('info', `📥 Got session data to save (${sessionSize} bytes)`);
       
-      if (sessionSize < 1000) {
+      if (sessionSize < 5000) {
         log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
         return false;
       }
@@ -216,6 +216,24 @@ async function safelyTriggerSessionSave(client) {
         
         await client.authStrategy.save(sessionData);
         log('info', '📥 Session save triggered with valid data');
+
+        // Extra: Create a backup copy of session data directly to file system
+try {
+  const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+  }
+  
+  const backupFile = path.join(sessionDir, 'session_backup.json');
+  await fs.promises.writeFile(
+    backupFile,
+    JSON.stringify(sessionData),
+    { encoding: 'utf8' }
+  );
+  log('info', '📥 Created additional filesystem backup of session');
+} catch (backupErr) {
+  log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
+}
         return true;
       } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
         // For RemoteAuth fallback
@@ -317,7 +335,7 @@ class EnhancedLocalAuth extends LocalAuth {
     if (data?.session_data) {
       // Check if session data is valid
       const sessionSize = JSON.stringify(data.session_data).length;
-      if (sessionSize < 1000) {
+      if (sessionSize < 5000) {
         log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
         return;
       }
@@ -362,7 +380,7 @@ class EnhancedLocalAuth extends LocalAuth {
             { encoding: 'utf8' }
           );
           
-          if (savedContent && savedContent.length > 1000) {
+          if (savedContent && savedContent.length > 5000) {
             log('info', '✓ Session file verification successful');
             break; // Success - exit retry loop
           } else {
@@ -471,7 +489,7 @@ class EnhancedLocalAuth extends LocalAuth {
       log('info', `Saving session to Supabase (${sessionSize} bytes)`);
       
       // One final check before saving to Supabase
-      if (sessionSize < 1000) {
+      if (sessionSize < 5000) {
         log('warn', `Session is still too small (${sessionSize} bytes), skipping Supabase save`);
         return;
       }
@@ -2087,6 +2105,8 @@ const server = app.listen(PORT, () => {
   log('info', `💼 Valuation webhook: ${VALUATION_WEBHOOK_URL ? 'Configured' : 'Not configured'}`);
   log('info', `💰 Interest rate webhook: ${INTEREST_RATE_WEBHOOK_URL ? 'Configured' : 'Not configured'}`);
   
+  // Force restoration attempt before checking status
+forceSessionRestoration().then(() => {
   // Check if session is valid first, and delete if not
   checkSessionStatus().then(hasValidSession => {
     if (!hasValidSession) {
@@ -2096,6 +2116,7 @@ const server = app.listen(PORT, () => {
     // Start WhatsApp client
     startClient();
   });
+});
   
   // Setup self-ping to keep service alive
   setInterval(() => {
