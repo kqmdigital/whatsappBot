@@ -414,7 +414,7 @@ class EnhancedLocalAuth extends LocalAuth {
   
   async save(session) {
     // Check if session is valid and has sufficient data
-    if (!session || JSON.stringify(session).length < 1000) {
+    if (!session || JSON.stringify(session).length < 5000) {
       log('warn', '⚠️ Session data appears too small or invalid');
       
       // Skip trying all other methods and go straight to direct localStorage extraction
@@ -1098,7 +1098,7 @@ async function checkSessionStatus() {
     log('info', `✅ Found session in Supabase (${sessionDataSize} bytes)`);
     
     // Session data less than 1000 bytes is almost certainly invalid
-    if (sessionDataSize < 1000) {
+    if (sessionDataSize < 5000) {
       log('warn', '⚠️ Session data appears to be too small, might be invalid');
       await clearInvalidSession();
       return false;
