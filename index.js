@@ -135,34 +135,47 @@ async function extractSessionData(client) {
   }
   
   try {
-    // Go directly for full localStorage extraction - most reliable based on logs
+    // Improved localStorage extraction 
     const rawLocalStorage = await client.pupPage.evaluate(() => {
       try {
+        // First, verify WAWebJS has properly loaded
+        if (typeof window.Store === 'undefined' || !window.Store) {
+          console.error("WhatsApp Web Store not initialized");
+          return { error: "Store not initialized" };
+        }
+        
+        // Extract ALL localStorage data comprehensively
         const data = {};
         for (let i = 0; i < localStorage.length; i++) {
           const key = localStorage.key(i);
           data[key] = localStorage.getItem(key);
         }
+        
+        // Add additional WAWebJS-specific session data if available
+        if (window.Store && window.Store.AppState) {
+          data['WAWebJS_AppState'] = JSON.stringify(window.Store.AppState.serialize());
+        }
+        
         return data;
       } catch (e) {
         console.error("Error extracting localStorage:", e);
-        return null;
+        return { error: e.toString() };
       }
     });
+    
+    if (rawLocalStorage && rawLocalStorage.error) {
+      log('warn', `⚠️ Error in page extraction: ${rawLocalStorage.error}`);
+      return null;
+    }
     
     if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
       log('info', `🔍 Extracted raw localStorage with ${Object.keys(rawLocalStorage).length} items`);
       
-      // Check if this extraction actually has valuable data
+      // Validate session size
       const sessionSize = JSON.stringify(rawLocalStorage).length;
-      if (sessionSize < 1000) {
+      if (sessionSize < 5000) {  // Increased minimum size threshold
         log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
-        return {
-          state: "CONNECTED",
-          timestamp: new Date().toISOString(),
-          fallback: true,
-          note: "Session data was too small"
-        };
+        return null;
       } else {
         return rawLocalStorage;
       }
@@ -170,21 +183,10 @@ async function extractSessionData(client) {
       log('warn', 'localStorage extraction found too few items');
     }
     
-    // Fallback minimal valid session
-    return {
-      state: "CONNECTED",
-      timestamp: new Date().toISOString(),
-      fallback: true
-    };
+    return null;
   } catch (err) {
     log('error', `Failed to extract session data: ${err.message}`);
-    // Return at least the state if nothing else works
-    return {
-      state: "CONNECTED",
-      timestamp: new Date().toISOString(),
-      fallback: true,
-      error: err.message
-    };
+    return null;
   }
 }
 
@@ -612,19 +614,21 @@ function createWhatsAppClient() {
         '--disable-site-isolation-trials',
       ],
       defaultViewport: null, // Allow responsive viewport
-      timeout: 120000, // 2 minute timeout for browser launch
-      protocolTimeout: 60000, // Protocol timeout to reduce errors
+      timeout: 180000, // 2 minute timeout for browser launch
+      protocolTimeout: 90000, // Protocol timeout to reduce errors
     },
     webVersionCache: {
-      type: 'local', // Change to local for better stability
+       type: 'remote', // Change to local for better stability
     },
-    qrTimeout: 0, // Never timeout waiting for QR
-    restartOnAuthFail: true,
-    takeoverOnConflict: true,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36', // Updated Chrome UA
-    multiDevice: true, // Enable multi-device beta for better session persistence
-    sessionCacheEnabled: true, // Enable session caching to reload faster
-  });
+    qrMaxRetries: 3, // Add this to limit QR code attempts
+  restartOnAuthFail: true,
+  takeoverOnConflict: true,
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  multiDevice: true,
+  sessionCacheEnabled: true,
+  clearSessionOnLogout: false, // Add this to preserve session on logout
+  webVersion: '2.2318.11', // Try specifying a stable WhatsApp Web version
+});
 }
 
 // Handle Render sleep detection and preparation
@@ -1089,6 +1093,47 @@ async function checkSessionStatus() {
   }
 }
 
+async function forceSessionRestoration() {
+  try {
+    log('info', '🔄 Performing forced session restoration attempt');
+    
+    // Get session data directly from Supabase
+    const { data, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_data')
+      .eq('session_key', SESSION_ID)
+      .single();
+      
+    if (error || !data || !data.session_data) {
+      log('error', `Failed to retrieve session: ${error?.message || 'No data'}`);
+      return false;
+    }
+    
+    // Write it to a file directly
+    const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+    }
+    
+    const sessionFile = path.join(sessionDir, 'session.json');
+    await fs.promises.writeFile(
+      sessionFile,
+      JSON.stringify(data.session_data),
+      { encoding: 'utf8' }
+    );
+    
+    log('info', '✅ Force-wrote session data from Supabase');
+    
+    // Verify the file
+    const stats = fs.statSync(sessionFile);
+    log('info', `Session file size: ${stats.size} bytes`);
+    
+    return true;
+  } catch (err) {
+    log('error', `Force restoration failed: ${err.message}`);
+    return false;
+  }
+}
 // Improved client starter with mutex to prevent multiple initializations
 async function startClient() {
   if (isClientInitializing) {
@@ -1155,9 +1200,14 @@ async function startClient() {
     }, 1000);
     
     setupClientEvents(client);
+// In your startClient function
+log('info', '🚀 Starting WhatsApp client...');
+client = createWhatsAppClient();
 
+// Add a longer delay before initialization
+log('info', '⏱️ Waiting 5 seconds before initialization...');
     // Add a delay before initialization to ensure session files are properly set up
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 5000));
     log('info', '🚀 Starting client initialization');
     
     await client.initialize();
