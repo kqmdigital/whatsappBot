@@ -286,36 +286,42 @@ class EnhancedLocalAuth extends LocalAuth {
     }
   }
 
-  async afterInit(client) {
-    await super.afterInit(client);
+ async afterInit(client) {
+  await super.afterInit(client);
+  
+  // Keep a reference to the client for session extraction
+  this.client = client;
+  
+  try {
+    log('info', '🔍 Attempting to restore session from Supabase...');
     
-    // Keep a reference to the client for session extraction
-    this.client = client;
+    // Try to load session from Supabase first
+    const { data, error } = await this.supabase
+      .from('whatsapp_sessions')
+      .select('session_data')
+      .eq('session_key', this.sessionId)
+      .single();
     
-    try {
-      // Try to load session from Supabase first
-      const { data, error } = await this.supabase
-        .from('whatsapp_sessions')
-        .select('session_data')
-        .eq('session_key', this.sessionId)
-        .single();
-      
-      if (error) {
-        log('warn', `Failed to query session from Supabase: ${error.message}`);
+    if (error) {
+      log('warn', `Failed to query session from Supabase: ${error.message}`);
+      return;
+    }
+    
+    if (data?.session_data) {
+      // Check if session data is valid
+      const sessionSize = JSON.stringify(data.session_data).length;
+      if (sessionSize < 1000) {
+        log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
         return;
       }
       
-      if (data?.session_data) {
-        // Check if session data is valid
-        const sessionSize = JSON.stringify(data.session_data).length;
-        if (sessionSize < 1000) {
-          log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
-          return;
-        }
-        
-        log('info', `Found session in Supabase (${sessionSize} bytes)`);
-        
-        // Save to local storage
+      log('info', `✅ Found valid session in Supabase (${sessionSize} bytes)`);
+      
+      // Save to local storage with retries
+      let retries = 0;
+      const maxRetries = 3;
+      
+      while (retries < maxRetries) {
         try {
           const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
           if (!fs.existsSync(sessionDir)) {
@@ -327,15 +333,46 @@ class EnhancedLocalAuth extends LocalAuth {
             JSON.stringify(data.session_data),
             { encoding: 'utf8' }
           );
+          
           log('info', '✅ Session restored from Supabase to local storage');
+          
+          // Add a forced delay to ensure proper session loading
+          log('info', '⏳ Waiting 3 seconds for session to be properly applied...');
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          
+          // Verify the file was written correctly
+          const savedContent = await fs.promises.readFile(
+            path.join(sessionDir, 'session.json'),
+            { encoding: 'utf8' }
+          );
+          
+          if (savedContent && savedContent.length > 1000) {
+            log('info', '✓ Session file verification successful');
+            break; // Success - exit retry loop
+          } else {
+            throw new Error('Session file verification failed');
+          }
         } catch (writeErr) {
-          log('error', `Failed to write session to local storage: ${writeErr.message}`);
+          retries++;
+          log('warn', `Session restoration attempt ${retries}/${maxRetries} failed: ${writeErr.message}`);
+          
+          if (retries >= maxRetries) {
+            log('error', `❌ Failed to restore session after ${maxRetries} attempts`);
+          } else {
+            // Wait before retry with exponential backoff
+            const delay = 1000 * Math.pow(2, retries);
+            log('info', `⏱️ Waiting ${delay}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
         }
       }
-    } catch (err) {
-      log('warn', `Failed to restore session from Supabase: ${err.message}`);
+    } else {
+      log('info', '❓ No session data found in Supabase');
     }
+  } catch (err) {
+    log('warn', `Failed to restore session from Supabase: ${err.message}`);
   }
+}
   
   async save(session) {
     // Check if session is valid and has sufficient data
