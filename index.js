@@ -1647,6 +1647,7 @@ app.get('/status', async (req, res) => {
 });
 
 // Force session save endpoint
+// Force session save endpoint with verification
 app.post('/save-session', async (req, res) => {
   if (!client || !client.authStrategy) {
     return res.status(503).json({ 
@@ -1657,13 +1658,38 @@ app.post('/save-session', async (req, res) => {
   
   try {
     log('info', '📥 Manual session save requested');
-    await safelyTriggerSessionSave(client);
-    log('info', '📥 Manual session save completed');
+    const result = await safelyTriggerSessionSave(client);
     
-    return res.status(200).json({ 
-      success: true, 
-      message: 'Session saved successfully'
-    });
+    if (result) {
+      log('info', '📥 Manual session save completed successfully');
+      
+      // Verify the session was saved to Supabase
+      const { data, error } = await supabase
+        .from('whatsapp_sessions')
+        .select('updated_at')
+        .eq('session_key', SESSION_ID)
+        .single();
+      
+      if (error || !data) {
+        log('warn', '⚠️ Session verification failed: Session not found in Supabase');
+        return res.status(500).json({
+          success: false,
+          error: 'Session save verification failed'
+        });
+      }
+      
+      return res.status(200).json({ 
+        success: true, 
+        message: 'Session saved and verified successfully',
+        updated_at: data.updated_at
+      });
+    } else {
+      log('warn', '⚠️ Session save operation did not complete successfully');
+      return res.status(500).json({
+        success: false,
+        error: 'Session save operation did not complete successfully'
+      });
+    }
   } catch (err) {
     log('error', `Failed to manually save session: ${err.message}`);
     return res.status(500).json({ 
