@@ -2406,3 +2406,11 @@ app.post('/save-session', async (req, res) => {
       error: err.message 
     });
   }})
+
+// Start the server
+app.listen(PORT, () => {
+  log('info', `✅ Server listening on port ${PORT}`);
+});
+
+// Start queue processor
+setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
