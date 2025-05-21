@@ -21,6 +21,48 @@ const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
 const BOT_VERSION = '2.0.1'; // Updated version
 const startedAt = Date.now();
 
+// Utility function to extract just the hash part of a WhatsApp message ID
+function extractMessageHash(serializedId) {
+  if (!serializedId) return null;
+  
+  // Pattern: true_CHATID_HASH_SENDERID
+  const parts = serializedId.split('_');
+  
+  // If we have at least 3 parts, the hash should be the third part (index 2)
+  if (parts.length >= 3) {
+    return parts[2];
+  }
+  
+  // If it's already just a hash (no underscores), return as is
+  if (serializedId.indexOf('_') === -1) {
+    return serializedId;
+  }
+  
+  // Fallback - return original if we can't parse it
+  return serializedId;
+}
+
+// Create a simple cache for message ID mapping
+const messageIdCache = new Map();
+
+// Function to save ID mappings
+function saveMessageIdMapping(fullId, hash) {
+  messageIdCache.set(hash, fullId);
+  // Limit cache size to prevent memory issues
+  if (messageIdCache.size > 1000) {
+    // Delete oldest entries
+    const keys = Array.from(messageIdCache.keys());
+    for (let i = 0; i < 200; i++) {
+      messageIdCache.delete(keys[i]);
+    }
+  }
+}
+
+// Function to look up full ID from hash
+function getFullMessageId(hash) {
+  return messageIdCache.get(hash);
+}
+
 // Enhanced logging with levels
 const log = (level, message, ...args) => {
   const timestamp = new Date().toISOString();
@@ -347,7 +389,7 @@ class EnhancedLocalAuth extends LocalAuth {
         .from('whatsapp_sessions')
         .select('session_data')
         .eq('session_key', this.sessionId)
-        .single();
+        .maybeSingle(); // Changed from .single() to .maybeSingle()
       
       if (error) {
         log('warn', `Failed to query session from Supabase: ${error.message}`);
@@ -1054,7 +1096,14 @@ async function handleIncomingMessage(msg) {
     const chatId = msg.from;
     const senderId = msg.author || msg.from;
     const text = msg.body || '';
-    const messageId = msg.id._serialized || '';
+    
+    // Updated to extract message hash
+    const fullMessageId = msg.id._serialized || '';
+    const messageId = extractMessageHash(fullMessageId);
+    log('info', `📝 Processing message hash: ${messageId} (full: ${fullMessageId})`);
+    
+    // Store the mapping for future reference
+    saveMessageIdMapping(fullMessageId, messageId);
 
     let replyInfo = null;
     let hasReply = false;
@@ -1064,11 +1113,18 @@ async function handleIncomingMessage(msg) {
       const quoted = await msg.getQuotedMessage?.();
       if (quoted?.id?._serialized) {
         hasReply = true;
+        const quotedFullId = quoted.id._serialized;
+        const quotedHashId = extractMessageHash(quotedFullId);
+        
         replyInfo = {
-          message_id: quoted.id._serialized || null,
+          message_id: quotedHashId || null,
+          full_message_id: quotedFullId || null,
           text: quoted?.body || null,
         };
-        log('info', `📝 Message ${messageId} is replying to message ${replyInfo.message_id}`);
+        // Store this mapping too
+        saveMessageIdMapping(quotedFullId, quotedHashId);
+        
+        log('info', `📝 Message ${messageId} is replying to message hash ${replyInfo.message_id}`);
       }
     } catch (err) {
       log('warn', `⚠️ Failed to get quoted message: ${err.message}`);
@@ -1122,7 +1178,8 @@ async function handleIncomingMessage(msg) {
       groupId: chatId,
       senderId,
       text,
-      messageId,
+      messageId: messageId, // This is now just the hash part
+      fullMessageId: fullMessageId, // Keep the full ID for reference
       hasReply,
       replyInfo,
       timestamp: new Date(msg.timestamp * 1000).toISOString(),
@@ -1164,8 +1221,8 @@ async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
   
   // Ensure message IDs are clearly labeled
   if (payload.messageId) {
-    // Save original message ID format
-    payload.whatsapp_messageId = payload.messageId;
+    // Save original message ID format - use hash now
+    payload.whatsapp_messageId = payload.fullMessageId;
     
     // If this is a reply, create a clear relationship
     if (payload.hasReply && payload.replyInfo && payload.replyInfo.message_id) {
@@ -1223,12 +1280,41 @@ async function checkSessionStatus() {
   try {
     log('info', '🔍 Checking WhatsApp session status in Supabase...');
     
+    // First try to get a count to see if there are multiple entries
+    const { data: countData, error: countError } = await supabase
+      .from('whatsapp_sessions')
+      .select('*', { count: 'exact' })
+      .eq('session_key', SESSION_ID);
+      
+    if (countError) {
+      log('error', `❌ Failed to count sessions: ${countError.message}`);
+      return false;
+    }
+    
+    // If more than one entry exists, delete all of them
+    if (countData && countData.length > 1) {
+      log('warn', `⚠️ Found ${countData.length} session entries with the same key. Cleaning up...`);
+      
+      const { error: deleteError } = await supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('session_key', SESSION_ID);
+        
+      if (deleteError) {
+        log('error', `Failed to delete duplicate sessions: ${deleteError.message}`);
+      } else {
+        log('info', '✅ Duplicate sessions deleted');
+      }
+      
+      return false;
+    }
+    
+    // Now try to get the single session
     const { data, error } = await supabase
       .from('whatsapp_sessions')
       .select('*')
       .eq('session_key', SESSION_ID)
-      .limit(1)
-      .single();
+      .maybeSingle(); // Use maybeSingle() instead of single()
     
     if (error) {
       log('error', `❌ Failed to check session status: ${error.message}`);
@@ -1243,8 +1329,7 @@ async function checkSessionStatus() {
         .from('whatsapp_sessions')
         .select('*')
         .eq('session_key', `${SESSION_ID}_backup`)
-        .limit(1)
-        .single();
+        .maybeSingle(); // Use maybeSingle() here too
         
       if (!backupError && backupData) {
         log('info', '🔄 Found backup session, restoring...');
@@ -1273,7 +1358,7 @@ async function checkSessionStatus() {
     const sessionDataSize = JSON.stringify(data.session_data).length;
     log('info', `✅ Found session in Supabase (${sessionDataSize} bytes)`);
     
-    // Session data less than 1000 bytes is almost certainly invalid
+    // Session data less than 5000 bytes is almost certainly invalid
     if (sessionDataSize < 5000) {
       log('warn', '⚠️ Session data appears to be too small, might be invalid');
       await clearInvalidSession();
@@ -1296,7 +1381,7 @@ async function forceSessionRestoration() {
       .from('whatsapp_sessions')
       .select('session_data')
       .eq('session_key', SESSION_ID)
-      .single();
+      .maybeSingle(); // Changed from .single() to .maybeSingle()
       
     if (error || !data || !data.session_data) {
       log('error', `Failed to retrieve session: ${error?.message || 'No data'}`);
@@ -1360,7 +1445,7 @@ async function startClient() {
           .from('whatsapp_sessions')
           .select('session_data')
           .eq('session_key', SESSION_ID)
-          .single();
+          .maybeSingle(); // Changed from .single() to .maybeSingle()
           
         if (data?.session_data) {
           const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
@@ -1545,13 +1630,17 @@ async function processMessageQueue() {
             ...options
           });
           
-          const rawMessageId = sentMessage.id._serialized;
-          log('info', `📤 Media message sent successfully with ID: ${rawMessageId}`);
+          const fullMessageId = sentMessage.id._serialized;
+          const messageHash = extractMessageHash(fullMessageId);
+          saveMessageIdMapping(fullMessageId, messageHash);
+          
+          log('info', `📤 Media message sent successfully with ID hash: ${messageHash} (full: ${fullMessageId})`);
           
           callback({ 
             success: true, 
-            messageId: rawMessageId,
-            message_id: rawMessageId,
+            messageId: messageHash,
+            full_message_id: fullMessageId,
+            message_id: messageHash, 
             timestamp: new Date().toISOString()
           });
         } catch (mediaErr) {
@@ -1561,12 +1650,15 @@ async function processMessageQueue() {
           log('info', '📤 Falling back to text-only message');
           sentMessage = await client.sendMessage(jid, `${message || ''}\n\n[Media could not be sent: ${imageUrl}]`);
           
-          const rawMessageId = sentMessage.id._serialized;
+          const fullMessageId = sentMessage.id._serialized;
+          const messageHash = extractMessageHash(fullMessageId);
+          saveMessageIdMapping(fullMessageId, messageHash);
           
           callback({ 
             success: true, 
-            messageId: rawMessageId,
-            message_id: rawMessageId, 
+            messageId: messageHash,
+            full_message_id: fullMessageId,
+            message_id: messageHash, 
             timestamp: new Date().toISOString()
           });
         }
@@ -1578,12 +1670,15 @@ async function processMessageQueue() {
           log('info', '📤 Sending fallback text message without media');
           sentMessage = await client.sendMessage(jid, `${message || ''}\n\n[Media could not be processed: ${imageUrl}]`);
           
-          const rawMessageId = sentMessage.id._serialized;
+          const fullMessageId = sentMessage.id._serialized;
+          const messageHash = extractMessageHash(fullMessageId);
+          saveMessageIdMapping(fullMessageId, messageHash);
           
           callback({ 
             success: true, 
-            messageId: rawMessageId,
-            message_id: rawMessageId, 
+            messageId: messageHash,
+            full_message_id: fullMessageId,
+            message_id: messageHash, 
             timestamp: new Date().toISOString()
           });
         } catch (textErr) {
@@ -1620,8 +1715,11 @@ async function processMessageQueue() {
         log('info', '📤 Sending text message...');
         sentMessage = await client.sendMessage(jid, message, options);
         
-        const rawMessageId = sentMessage.id._serialized;
-        log('info', `📤 Text message sent successfully with ID: ${rawMessageId}`);
+        const fullMessageId = sentMessage.id._serialized;
+        const messageHash = extractMessageHash(fullMessageId);
+        saveMessageIdMapping(fullMessageId, messageHash);
+        
+        log('info', `📤 Text message sent successfully with ID hash: ${messageHash} (full: ${fullMessageId})`);
         
         // Update activity time
         lastActivityTime = Date.now();
@@ -1629,8 +1727,9 @@ async function processMessageQueue() {
         
         callback({ 
           success: true, 
-          messageId: rawMessageId,
-          message_id: rawMessageId, 
+          messageId: messageHash,
+          full_message_id: fullMessageId,
+          message_id: messageHash, 
           timestamp: new Date().toISOString()
         });
         
@@ -1644,12 +1743,15 @@ async function processMessageQueue() {
           await new Promise(resolve => setTimeout(resolve, 1000));
           sentMessage = await client.sendMessage(jid, message, options);
           
-          const rawMessageId = sentMessage.id._serialized;
+          const fullMessageId = sentMessage.id._serialized;
+          const messageHash = extractMessageHash(fullMessageId);
+          saveMessageIdMapping(fullMessageId, messageHash);
           
           callback({ 
             success: true, 
-            messageId: rawMessageId,
-            message_id: rawMessageId, 
+            messageId: messageHash,
+            full_message_id: fullMessageId,
+            message_id: messageHash, 
             timestamp: new Date().toISOString()
           });
         } catch (retryErr) {
@@ -1683,8 +1785,6 @@ async function processMessageQueue() {
     }
   }
 }
-
-// We'll no longer normalize message IDs - we'll use the raw WhatsApp IDs
 
 // Enhanced Express server with basic security
 const app = express();
@@ -1862,12 +1962,12 @@ app.get('/session', async (req, res) => {
   }
 });
 
-// Message status tracking endpoint
+// Modified message status tracking endpoint to handle hash IDs
 app.get('/message/:messageId', async (req, res) => {
   try {
-    const messageId = req.params.messageId;
+    const messageHash = req.params.messageId;
     
-    if (!messageId) {
+    if (!messageHash) {
       return res.status(400).json({
         success: false,
         error: 'Missing messageId parameter'
@@ -1891,8 +1991,65 @@ app.get('/message/:messageId', async (req, res) => {
         });
       }
       
-      // Try to get message status
-      const message = await client.getMessageById(messageId);
+      // Need to find the full message ID first by searching through the cache or using the hash
+      log('info', `🔍 Looking for message with hash: ${messageHash}`);
+      let fullMessageId = null;
+      
+      // If the messageHash is already a full ID (contains underscores), use as is
+      if (messageHash.includes('_')) {
+        fullMessageId = messageHash;
+        log('info', `Using provided full message ID: ${fullMessageId}`);
+      } else {
+        // First check the cache
+        fullMessageId = getFullMessageId(messageHash);
+        
+        if (fullMessageId) {
+          log('info', `Found full message ID in cache: ${fullMessageId} for hash: ${messageHash}`);
+        } else {
+          // We need to search recent messages to find the full ID
+          // This is a simplified approach - for production you might need a more robust method
+          try {
+            // Get chats
+            const chats = await client.getChats();
+            
+            for (const chat of chats) {
+              try {
+                // Get recent messages
+                const messages = await chat.fetchMessages({ limit: 50 });
+                
+                // Look for the message with the matching hash
+                const matchingMessage = messages.find(msg => 
+                  extractMessageHash(msg.id._serialized) === messageHash
+                );
+                
+                if (matchingMessage) {
+                  fullMessageId = matchingMessage.id._serialized;
+                  log('info', `Found full message ID: ${fullMessageId} for hash: ${messageHash}`);
+                  // Save to cache for future use
+                  saveMessageIdMapping(fullMessageId, messageHash);
+                  break;
+                }
+              } catch (chatErr) {
+                // Skip errors in individual chats
+                log('warn', `Error fetching messages from chat: ${chatErr.message}`);
+                continue;
+              }
+            }
+          } catch (findErr) {
+            log('error', `Failed to search for message: ${findErr.message}`);
+          }
+        }
+      }
+      
+      if (!fullMessageId) {
+        return res.status(404).json({
+          success: false,
+          error: `Could not find full message ID for hash: ${messageHash}`
+        });
+      }
+      
+      // Try to get message status using the full ID
+      const message = await client.getMessageById(fullMessageId);
       
       if (!message) {
         return res.status(404).json({
@@ -1901,16 +2058,20 @@ app.get('/message/:messageId', async (req, res) => {
         });
       }
       
+      const quotedMsgId = message._data?.quotedStanzaID ? 
+        extractMessageHash(message._data.quotedStanzaID) : null;
+      
       return res.status(200).json({
         success: true,
-        messageId: messageId,
+        messageId: messageHash,
+        fullMessageId: fullMessageId,
         status: message.ack || 0, // 0: pending, 1: received, 2: viewed, 3: played (for audio/video)
         timestamp: new Date(message.timestamp * 1000).toISOString(),
         from: message.from,
         to: message.to,
         hasMedia: Boolean(message.hasMedia),
         body: message.body,
-        quotedMsgId: message._data?.quotedStanzaID || null
+        quotedMsgId: quotedMsgId
       });
       
     } catch (err) {
@@ -2023,9 +2184,9 @@ app.post('/send-message', async (req, res) => {
     });
   }
 
-  // Wait for the message to be sent and get the real WhatsApp message ID
+  // Wait for the message to be sent and get the message hash
   try {
-    // Create a promise that resolves when we get the real message ID
+    // Create a promise that resolves when we get the message hash
     const messageResult = await new Promise((resolve, reject) => {
       // Add message to queue
       messageQueue.push({
@@ -2054,11 +2215,12 @@ app.post('/send-message', async (req, res) => {
       }
     });
     
-    // When we get here, the message has been sent and we have the real ID
+    // When we get here, the message has been sent and we have the message hash
     return res.status(200).json({
       success: true,
       message: 'Message sent successfully',
-      messageId: messageResult.messageId,
+      messageId: messageResult.messageId, // This is now the hash
+      fullMessageId: messageResult.full_message_id, // Also return the full ID for reference
       timestamp: messageResult.timestamp
     });
   } catch (err) {
@@ -2131,7 +2293,8 @@ app.get('/status', async (req, res) => {
       messagesProcessed: messageCount,
       needsQrScan: Boolean(currentQRCode),
       hasSession: sessionStatus,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      cacheSize: messageIdCache.size
     });
   } catch (err) {
     log('error', `Status check error: ${err.message}`);
@@ -2214,7 +2377,7 @@ app.post('/save-session', async (req, res) => {
         .from('whatsapp_sessions')
         .select('updated_at')
         .eq('session_key', SESSION_ID)
-        .single();
+        .maybeSingle();
       
       if (error || !data) {
         log('warn', '⚠️ Session verification failed: Session not found in Supabase');
@@ -2242,495 +2405,4 @@ app.post('/save-session', async (req, res) => {
       success: false, 
       error: err.message 
     });
-  }
-});
-
-// Force browser reset endpoint
-app.post('/reset-browser', async (req, res) => {
-  log('info', '🔄 Manual browser reset requested');
-  
-  res.status(202).json({ 
-    success: true, 
-    message: 'Browser reset initiated' 
-  });
-  
-  // Force next watchdog check to restart the browser
-  await performPeriodicBrowserReset();
-});
-
-// Force restart endpoint
-app.post('/restart', async (req, res) => {
-  log('info', '🔄 Manual restart requested');
-  
-  res.status(202).json({ 
-    success: true, 
-    message: 'Restart initiated' 
-  });
-  
-  // Try to save session before restarting
-  if (client && client.authStrategy) {
-    try {
-      log('info', '📥 Saving session before manual restart');
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before manual restart');
-    } catch (err) {
-      log('error', `Failed to save session before manual restart: ${err.message}`);
-    }
-  }
-  
-  // Clear message queue
-  const queueLength = messageQueue.length;
-  if (queueLength > 0) {
-    log('info', `Clearing message queue (${queueLength} items)`);
-    messageQueue.length = 0;
-    isProcessingQueue = false;
-  }
-  
-  // Destroy and restart client
-  if (client) {
-    try {
-      await client.destroy();
-    } catch (err) {
-      log('error', `Error during manual client destroy: ${err.message}`);
-    } finally {
-      client = null;
-      // Reset counters on manual restart
-      connectionRetryCount = 0; 
-      messagesSentLastHour = 0;
-    }
-  }
-  
-  // Start client after a short delay
-  setTimeout(startClient, 2000);
-});
-
-// Queue management endpoints
-app.get('/queue', (req, res) => {
-  res.status(200).json({
-    queue_length: messageQueue.length,
-    is_processing: isProcessingQueue,
-    sent_this_hour: messagesSentLastHour,
-    hourly_limit: MAX_MESSAGES_PER_HOUR,
-    time_until_reset: lastHourReset + (60 * 60 * 1000) - Date.now(),
-    queue_preview: messageQueue.slice(0, 5).map(item => ({
-      jid: item.jid,
-      added_at: new Date(item.addedAt).toISOString(),
-      message_preview: item.message ? 
-        (item.message.length > 30 ? item.message.substring(0, 30) + '...' : item.message) : 
-        (item.imageUrl ? '[IMAGE]' : '[UNKNOWN]')
-    }))
-  });
-});
-
-// Clear queue endpoint
-app.post('/queue/clear', (req, res) => {
-  const queueLength = messageQueue.length;
-  messageQueue.length = 0;
-  isProcessingQueue = false;
-  
-  res.status(200).json({
-    success: true,
-    message: `Queue cleared (${queueLength} items removed)`
-  });
-});
-
-// Webhook configuration endpoint
-app.get('/webhooks', (req, res) => {
-  res.status(200).json({
-    valuation: {
-      configured: Boolean(VALUATION_WEBHOOK_URL),
-      url: VALUATION_WEBHOOK_URL ? '[configured]' : null,
-    },
-    interestRate: {
-      configured: Boolean(INTEREST_RATE_WEBHOOK_URL),
-      url: INTEREST_RATE_WEBHOOK_URL ? '[configured]' : null,
-    }
-  });
-});
-
-// Health check endpoint
-app.get('/health', async (req, res) => {
-  try {
-    // Check WhatsApp client
-    const clientState = client ? await client.getState() : 'NO_CLIENT';
-    
-    // Check browser health
-    const isBrowserHealthy = client ? await checkBrowserHealth(client) : false;
-    
-    // Check Supabase connection
-    let supabaseStatus = 'UNKNOWN';
-    try {
-      const { data, error } = await supabase.from('whatsapp_sessions').select('count(*)', { count: 'exact', head: true });
-      supabaseStatus = error ? 'ERROR' : 'CONNECTED';
-    } catch (err) {
-      supabaseStatus = 'ERROR: ' + err.message;
-    }
-    
-    // Get memory metrics
-    const mem = process.memoryUsage();
-    
-    // Build health response
-    const health = {
-      status: clientState === 'CONNECTED' && supabaseStatus === 'CONNECTED' && isBrowserHealthy ? 'healthy' : 'degraded',
-      version: BOT_VERSION,
-      uptime: {
-        seconds: Math.floor((Date.now() - startedAt) / 1000),
-        readable: formatUptime(Date.now() - startedAt),
-      },
-      whatsapp: {
-        state: clientState,
-        ready: client ? true : false,
-        browserHealth: isBrowserHealthy,
-        timeSinceLastReset: formatUptime(Date.now() - lastBrowserReset),
-      },
-      webhooks: {
-        valuation: Boolean(VALUATION_WEBHOOK_URL),
-        interestRate: Boolean(INTEREST_RATE_WEBHOOK_URL),
-      },
-      supabase: supabaseStatus,
-      system: {
-        memory: {
-          rss: `${(mem.rss / 1024 / 1024).toFixed(1)} MB`,
-          heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`,
-          heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB`,
-          threshold: `${MEMORY_THRESHOLD_MB} MB`,
-        },
-        nodejs: process.version,
-      },
-      timestamp: new Date().toISOString(),
-    };
-    
-    res.status(200).json(health);
-  } catch (err) {
-    res.status(500).json({
-      status: 'error',
-      error: err.message,
-      timestamp: new Date().toISOString(),
-    });
-  }
-});
-
-// Helper function to format uptime
-function formatUptime(ms) {
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  
-  return `${days}d ${hours % 24}h ${minutes % 60}m ${seconds % 60}s`;
-}
-
-// Keep-alive endpoint
-app.get('/ping', (_, res) => {
-  res.status(200).send('pong');
-});
-
-// Add this new cleanup endpoint right after your other endpoints
-app.post('/cleanup-all-sessions', async (req, res) => {
-  try {
-    log('info', '🧹 Performing complete session cleanup...');
-    
-    // Delete from Supabase - all sessions including backups
-    const { error: deleteError } = await supabase
-      .from('whatsapp_sessions')
-      .delete()
-      .filter('session_key', 'like', `%${SESSION_ID}%`);
-    
-    if (deleteError) {
-      log('error', `Failed to delete sessions from Supabase: ${deleteError.message}`);
-    } else {
-      log('info', '✅ All sessions deleted from Supabase');
-    }
-    
-    // Clear local session files
-    const sessionDir = path.join(__dirname, `.wwebjs_auth`);
-    if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-      log('info', '✅ Local session directory removed');
-    } else {
-      log('info', 'No local session directory found');
-    }
-    
-    // Destroy client if it exists
-    if (client) {
-      try {
-        await client.destroy();
-        log('info', '✅ WhatsApp client destroyed');
-      } catch (destroyErr) {
-        log('error', `Error destroying client: ${destroyErr.message}`);
-      } finally {
-        client = null;
-      }
-    }
-    
-    // Reset state variables
-    currentQRCode = null;
-    connectionRetryCount = 0;
-    isClientInitializing = false;
-    updateSessionState(SESSION_STATES.INITIALIZING);
-    
-    // Response to the API caller
-    res.status(200).json({ 
-      success: true, 
-      message: 'All sessions cleared and client reset',
-      restart: 'Client will restart automatically in 5 seconds'
-    });
-    
-    // Restart client after a delay
-    setTimeout(startClient, 5000);
-  } catch (err) {
-    log('error', `Session cleanup failed: ${err.message}`);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-// Start server and initialize client
-const server = app.listen(PORT, () => {
-  log('info', `🚀 Server started on http://localhost:${PORT}`);
-  log('info', `🤖 Bot Version: ${BOT_VERSION}`);
-  log('info', `💼 Valuation webhook: ${VALUATION_WEBHOOK_URL ? 'Configured' : 'Not configured'}`);
-  log('info', `💰 Interest rate webhook: ${INTEREST_RATE_WEBHOOK_URL ? 'Configured' : 'Not configured'}`);
-  
-  // Force restoration attempt before checking status
-  forceSessionRestoration().then(() => {
-    // Check if session is valid first, and delete if not
-    checkSessionStatus().then(hasValidSession => {
-      if (!hasValidSession) {
-        log('warn', '⚠️ Invalid or missing session detected. Will ask for QR code on startup.');
-      }
-      
-      // Start WhatsApp client
-      startClient();
-    });
-  });
-});
-
-// Set up watchdog timer to detect and fix connection issues
-// IMPORTANT: Delay watchdog initialization to prevent it from running too early
-let watchdogInitialized = false;
-setTimeout(() => {
-  watchdogInitialized = true;
-  log('info', '🔍 Watchdog timer initialized and active');
-}, 180000); // Wait 3 minutes before enabling watchdog
-
-setInterval(async () => {
-  // Skip if watchdog hasn't been initialized yet or during client initialization
-  if (!watchdogInitialized || isClientInitializing) {
-    return;
-  }
-  
-  // Skip if no client exists
-  if (!client) {
-    return;
-  }
-  
-  // Only check browser health if puppeteer page and browser exist
-  if (client.pupPage && client.pupBrowser) {
-    try {
-      const isBrowserHealthy = await checkBrowserHealth(client);
-      
-      if (!isBrowserHealthy) {
-        log('warn', '⚠️ Watchdog detected unhealthy browser state, initiating restart');
-        
-        // Try to save session before restart
-        if (client.authStrategy) {
-          try {
-            await safelyTriggerSessionSave(client);
-            log('info', '📥 Session saved before watchdog restart');
-          } catch (err) {
-            log('error', `Failed to save session before watchdog restart: ${err.message}`);
-          }
-        }
-        
-        // Destroy and restart client
-        try {
-          await client.destroy();
-        } catch (err) {
-          log('error', `Error during watchdog client destroy: ${err.message}`);
-        } finally {
-          client = null;
-          setTimeout(startClient, 5000);
-        }
-        return;
-      }
-    } catch (err) {
-      log('error', `Watchdog browser health check error: ${err.message}`);
-      // Continue with other checks even if browser health check fails
-    }
-  }
-  
-  // Check for inactivity
-  const inactiveTime = Date.now() - lastActivityTime;
-  if (inactiveTime > 30 * 60 * 1000) { // 30 minutes of inactivity
-    log('warn', `⚠️ Watchdog detected ${Math.floor(inactiveTime/60000)} minutes of inactivity, checking connection`);
-    
-    try {
-      // Force a state check to verify connection
-      const state = await client.getState();
-      log('info', `Connection check: state is ${state}`);
-      
-      // Update activity time
-      lastActivityTime = Date.now();
-    } catch (err) {
-      log('error', `Watchdog connection check failed: ${err.message}`);
-      
-      // Try to save session before restart
-      if (client.authStrategy) {
-        try {
-          await safelyTriggerSessionSave(client);
-        } catch (saveErr) {
-          log('error', `Failed to save session during watchdog restart: ${saveErr.message}`);
-        }
-      }
-      
-      // Destroy and restart client
-      try {
-        await client.destroy();
-      } catch (destroyErr) {
-        log('error', `Error during watchdog client destroy: ${destroyErr.message}`);
-      } finally {
-        client = null;
-        setTimeout(startClient, 5000);
-      }
-    }
-  }
-  
-  // Perform periodic browser reset if needed
-  if (!isClientInitializing && client) {
-    try {
-      await performPeriodicBrowserReset();
-    } catch (err) {
-      log('error', `Periodic browser reset error: ${err.message}`);
-    }
-  }
-  
-}, WATCHDOG_INTERVAL);
-
-// Process cleanup on exit
-process.on('SIGTERM', async () => {
-  log('info', '🛑 SIGTERM received, shutting down gracefully');
-  
-  // Try to save session before exit
-  if (client && client.authStrategy) {
-    try {
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before exit');
-    } catch (err) {
-      log('error', `Failed to save session before exit: ${err.message}`);
-    }
-  }
-  
-  // Destroy client if it exists
-  if (client) {
-    try {
-      await client.destroy();
-      log('info', '🧹 Client destroyed during shutdown');
-    } catch (err) {
-      log('error', `Error destroying client during shutdown: ${err.message}`);
-    } finally {
-      client = null;
-    }
-  }
-  
-  // Close server
-  server.close(() => {
-    log('info', '👋 Server closed, exiting process');
-    process.exit(0);
-  });
-  
-  // Force exit after timeout
-  setTimeout(() => {
-    log('info', '⏱️ Force exit after timeout');
-    process.exit(1);
-  }, 10000);
-});
-
-// Handle SIGINT (Ctrl+C)
-process.on('SIGINT', async () => {
-  log('info', '🛑 SIGINT received, shutting down gracefully');
-  
-  // Try to save session before exit
-  if (client && client.authStrategy) {
-    try {
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before exit');
-    } catch (err) {
-      log('error', `Failed to save session before exit: ${err.message}`);
-    }
-  }
-  
-  // Destroy client if it exists
-  if (client) {
-    try {
-      await client.destroy();
-      log('info', '🧹 Client destroyed during shutdown');
-    } catch (err) {
-      log('error', `Error destroying client during shutdown: ${err.message}`);
-    } finally {
-      client = null;
-    }
-  }
-  
-  // Close server
-  server.close(() => {
-    log('info', '👋 Server closed, exiting process');
-    process.exit(0);
-  });
-  
-  // Force exit after timeout
-  setTimeout(() => {
-    log('info', '⏱️ Force exit after timeout');
-    process.exit(1);
-  }, 10000);
-});
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (err) => {
-  log('error', `💥 Uncaught exception: ${err.message}`);
-  log('error', err.stack);
-  // Continue running - don't exit
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  log('error', `🔥 Unhandled promise rejection: ${reason}`);
-  // Continue running - don't exit
-});
-
-// Add self-ping to prevent Render from sleeping
-if (process.env.SELF_PING_URL) {
-  const PING_INTERVAL = parseInt(process.env.SELF_PING_INTERVAL || '300000'); // 5 minutes by default
-  
-  log('info', `📡 Self-ping enabled, will ping ${process.env.SELF_PING_URL} every ${PING_INTERVAL/60000} minutes`);
-  
-  setInterval(async () => {
-    try {
-      log.debug(`🏓 Self-ping: ${process.env.SELF_PING_URL}`);
-      await axios.get(process.env.SELF_PING_URL, { timeout: 5000 });
-    } catch (err) {
-      log('warn', `Self-ping failed: ${err.message}`);
-    }
-  }, PING_INTERVAL);
-}
-
-// Set memory monitoring interval
-if (global.gc) {
-  // If garbage collection is exposed, monitor memory and trigger GC when needed
-  setInterval(() => {
-    const mem = process.memoryUsage();
-    const rssMB = Math.round(mem.rss / 1024 / 1024);
-    
-    if (rssMB > MEMORY_THRESHOLD_MB) {
-      log('warn', `Memory usage high (${rssMB}MB), running garbage collection`);
-      global.gc();
-      
-      // Log memory after GC
-      setTimeout(() => {
-        const memAfter = process.memoryUsage();
-        const rssMBAfter = Math.round(memAfter.rss / 1024 / 1024);
-        log('info', `Memory after GC: ${rssMBAfter}MB (reduced by ${rssMB - rssMBAfter}MB)`);
-      }, 1000);
-    }
-  }, 60000); // Check every minute
-}
-
-log('info', '✅ Application bootstrap completed, waiting for events...');
+  }})
