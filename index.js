@@ -1,2416 +1,783 @@
-// At the top with other imports
 const fs = require('fs');
 const path = require('path');
+const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
 const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-
-// Supabase configuration
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const VALUATION_WEBHOOK_URL = process.env.VALUATION_WEBHOOK_URL;
-const INTEREST_RATE_WEBHOOK_URL = process.env.INTEREST_RATE_WEBHOOK_URL;
-
-// Add retry package for better network request handling
-const { default: PQueue } = require('p-queue');
 
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '2.0.1'; // Updated version
+const BOT_VERSION = '1.0.0';
 const startedAt = Date.now();
 
-// Utility function to extract just the hash part of a WhatsApp message ID
-function extractMessageHash(serializedId) {
-  if (!serializedId) return null;
-  
-  // Pattern: true_CHATID_HASH_SENDERID
-  const parts = serializedId.split('_');
-  
-  // If we have at least 3 parts, the hash should be the third part (index 2)
-  if (parts.length >= 3) {
-    return parts[2];
-  }
-  
-  // If it's already just a hash (no underscores), return as is
-  if (serializedId.indexOf('_') === -1) {
-    return serializedId;
-  }
-  
-  // Fallback - return original if we can't parse it
-  return serializedId;
-}
+// Multiple webhook URLs support
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
+const INTEREST_RATE_WEBHOOK_URL = process.env.INTEREST_RATE_WEBHOOK_URL;
+const VALUATION_WEBHOOK_URL = process.env.VALUATION_WEBHOOK_URL;
 
-// Create a simple cache for message ID mapping
-const messageIdCache = new Map();
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
-// Function to save ID mappings
-function saveMessageIdMapping(fullId, hash) {
-  messageIdCache.set(hash, fullId);
-  // Limit cache size to prevent memory issues
-  if (messageIdCache.size > 1000) {
-    // Delete oldest entries
-    const keys = Array.from(messageIdCache.keys());
-    for (let i = 0; i < 200; i++) {
-      messageIdCache.delete(keys[i]);
-    }
-  }
-}
+console.log('🔍 Loaded Webhook URLs:');
+console.log('- N8N_WEBHOOK_URL:', N8N_WEBHOOK_URL);
+console.log('- INTEREST_RATE_WEBHOOK_URL:', INTEREST_RATE_WEBHOOK_URL);
+console.log('- VALUATION_WEBHOOK_URL:', VALUATION_WEBHOOK_URL);
 
-// Function to look up full ID from hash
-function getFullMessageId(hash) {
-  return messageIdCache.get(hash);
-}
-
-// Enhanced logging with levels
-const log = (level, message, ...args) => {
-  const timestamp = new Date().toISOString();
-  const formatted = `[${timestamp}] [${level.toUpperCase()}] [${SESSION_ID}] ${message}`;
-  
-  console[level in console ? level : 'log'](formatted, ...args);
-};
-
-// Add debug level specifically for self-pings
-log.debug = (message, ...args) => {
-  const timestamp = new Date().toISOString();
-  const formatted = `[${timestamp}] [DEBUG] [${SESSION_ID}] ${message}`;
-  
-  console.log(formatted, ...args);
-};
-
-// Helper function to download media with retries
-async function downloadMedia(url, options = {}) {
-  log('info', `🔽 Downloading media from ${url.substring(0, 50)}...`);
-  
-  const defaultOptions = {
-    timeout: 30000,
-    maxRetries: 3,
-    retryDelay: 2000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-      'Accept': 'image/*,*/*'
-    }
-  };
-  
-  const mergedOptions = { ...defaultOptions, ...options };
-  let lastError = null;
-  
-  for (let i = 0; i < mergedOptions.maxRetries; i++) {
-    try {
-      const response = await axios.get(url, {
-        responseType: 'arraybuffer',
-        timeout: mergedOptions.timeout,
-        headers: mergedOptions.headers
-      });
-      
-      const buffer = Buffer.from(response.data);
-      const mimeType = response.headers['content-type'] || 'application/octet-stream';
-      
-      log('info', `✅ Media downloaded successfully: ${buffer.length} bytes, type: ${mimeType}`);
-      
-      // Create MessageMedia object manually
-      return new MessageMedia(
-        mimeType,
-        buffer.toString('base64'),
-        url.split('/').pop() || 'file'
-      );
-    } catch (err) {
-      lastError = err;
-      log('warn', `⚠️ Media download attempt ${i+1}/${mergedOptions.maxRetries} failed: ${err.message}`);
-      
-      if (i < mergedOptions.maxRetries - 1) {
-        // Wait before retry with exponential backoff
-        const delay = mergedOptions.retryDelay * Math.pow(2, i);
-        log('info', `⏱️ Waiting ${delay}ms before retry...`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  }
-  
-  throw new Error(`Failed to download media after ${mergedOptions.maxRetries} attempts: ${lastError.message}`);
-}
-
-// Performance settings
-const MEMORY_THRESHOLD_MB = parseInt(process.env.MEMORY_THRESHOLD_MB || '400'); // Reduced from 450MB to 400MB
-const RECONNECT_DELAY = parseInt(process.env.RECONNECT_DELAY || '10000');
-const WATCHDOG_INTERVAL = parseInt(process.env.WATCHDOG_INTERVAL || '180000'); // Reduced from 5 minutes to 3 minutes
-const DEBUG_SESSION = process.env.DEBUG_SESSION === 'true' || false;
-let MAX_MESSAGES_PER_HOUR = 90; // Default, can be increased for regular accounts
-
-// Add session state machine
-const SESSION_STATES = {
-  INITIALIZING: 'initializing',
-  WAITING_FOR_QR: 'waiting_for_qr',
-  AUTHENTICATED: 'authenticated',
-  CONNECTED: 'connected',
-  DISCONNECTED: 'disconnected',
-  FAILED: 'failed'
-};
-
-let sessionState = SESSION_STATES.INITIALIZING;
-let isBusinessAccount = false;
-
-function updateSessionState(newState, details = {}) {
-  log('info', `Session state: ${sessionState} → ${newState}`);
-  sessionState = newState;
-  
-  // Take actions based on state transitions
-  if (newState === SESSION_STATES.AUTHENTICATED) {
-    // Force immediate session save on authentication
-    if (client && client.authStrategy) {
-      setTimeout(() => safelyTriggerSessionSave(client), 2000);
-    }
-  }
-  
-  if (newState === SESSION_STATES.DISCONNECTED) {
-    // Try to save session before disconnect
-    if (client && client.authStrategy) {
-      safelyTriggerSessionSave(client).catch(err => 
-        log('error', `Failed to save session on disconnect: ${err.message}`)
-      );
-    }
-  }
-}
-
-// Enhanced function to directly extract session data from WhatsApp Web
-async function extractSessionData(client) {
-  if (!client || !client.pupPage) {
-    log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
-    return null;
-  }
-  
-  try {
-    // Check if page is still usable
-    try {
-      const isPageAlive = await client.pupPage.evaluate(() => true).catch(() => false);
-      if (!isPageAlive) {
-        log('warn', '⚠️ Puppeteer page is no longer responsive, cannot extract data');
-        return null;
-      }
-    } catch (pageErr) {
-      log('warn', `⚠️ Error checking page status: ${pageErr.message}`);
-      return null;
-    }
-    
-    // Improved localStorage extraction 
-    const rawLocalStorage = await client.pupPage.evaluate(() => {
-      try {
-        // First, verify WAWebJS has properly loaded
-        if (typeof window.Store === 'undefined' || !window.Store) {
-          console.error("WhatsApp Web Store not initialized");
-          return { error: "Store not initialized" };
-        }
-        
-        // Extract ALL localStorage data comprehensively
-        const data = {};
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          data[key] = localStorage.getItem(key);
-        }
-        
-        // Add additional WAWebJS-specific session data if available
-        if (window.Store && window.Store.AppState) {
-          data['WAWebJS_AppState'] = JSON.stringify(window.Store.AppState.serialize());
-        }
-        
-        return data;
-      } catch (e) {
-        console.error("Error extracting localStorage:", e);
-        return { error: e.toString() };
-      }
-    }).catch(err => {
-      log('warn', `⚠️ Error during page evaluation: ${err.message}`);
-      return { error: err.message };
-    });
-    
-    if (rawLocalStorage && rawLocalStorage.error) {
-      log('warn', `⚠️ Error in page extraction: ${rawLocalStorage.error}`);
-      return null;
-    }
-    
-    if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
-      log('info', `🔍 Extracted raw localStorage with ${Object.keys(rawLocalStorage).length} items`);
-      
-      // Validate session size
-      const sessionSize = JSON.stringify(rawLocalStorage).length;
-      if (sessionSize < 5000) {  // Increased minimum size threshold
-        log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
-        return null;
-      } else {
-        return rawLocalStorage;
-      }
-    } else {
-      log('warn', 'localStorage extraction found too few items');
-    }
-    
-    return null;
-  } catch (err) {
-    log('error', `Failed to extract session data: ${err.message}`);
-    return null;
-  }
-}
-
-async function safelyTriggerSessionSave(client) {
-  if (!client || !client.pupPage) {
-    log('warn', '⚠️ Cannot save session: Client or pupPage not available');
-    return false;
-  }
-  
-  try {
-    // Use direct localStorage extraction to get session data
-    const sessionData = await extractSessionData(client);
-    
-    if (sessionData) {
-      const sessionSize = JSON.stringify(sessionData).length;
-      log('info', `📥 Got session data to save (${sessionSize} bytes)`);
-      
-      if (sessionSize < 5000) {
-        log('warn', `Session appears too small (${sessionSize} bytes), might be invalid`);
-        return false;
-      }
-      
-      // For enhanced LocalAuth, use the save method directly
-      if (client.authStrategy && typeof client.authStrategy.save === 'function') {
-        // Make sure client reference is set
-        if (client.authStrategy.client === null) {
-          client.authStrategy.client = client;
-          log('info', '🔗 Set client reference in auth strategy during save');
-        }
-        
-        await client.authStrategy.save(sessionData);
-        log('info', '📥 Session save triggered with valid data');
-
-        // Extra: Create a backup copy of session data directly to file system
-        try {
-          const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-          if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir, { recursive: true });
-          }
-          
-          const backupFile = path.join(sessionDir, 'session_backup.json');
-          await fs.promises.writeFile(
-            backupFile,
-            JSON.stringify(sessionData),
-            { encoding: 'utf8' }
-          );
-          log('info', '📥 Created additional filesystem backup of session');
-        } catch (backupErr) {
-          log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
-        }
-        return true;
-      } else if (client.authStrategy && typeof client.authStrategy.requestSave === 'function') {
-        // For RemoteAuth fallback
-        await client.authStrategy.requestSave();
-        log('info', '📥 Session save requested');
-        return true;
-      } else {
-        log('info', '📥 Session will be saved automatically (no manual save available)');
-        return false;
-      }
-    } else {
-      log('warn', '❓ Could not find valid session data for saving');
-      return false;
-    }
-  } catch (err) {
-    log('error', `Failed to request session save: ${err.message}`);
-    return false;
-  }
-}
-
-// Add validation for critical environment variables
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('❌ Missing Supabase credentials. Exiting.');
   process.exit(1);
 }
 
-// Validate at least one webhook URL is present
-if (!VALUATION_WEBHOOK_URL && !INTEREST_RATE_WEBHOOK_URL) {
-  console.error('❌ Missing both webhook URLs. At least one is required. Exiting.');
-  process.exit(1);
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Setup Supabase client with error handling
-let supabase;
-try {
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-  console.log('✅ Supabase client initialized');
-} catch (error) {
-  console.error('❌ Failed to initialize Supabase client:', error.message);
-  process.exit(1);
-}
+const log = (level, message, ...args) => {
+  const timestamp = new Date().toISOString();
+  const formatted = `[${timestamp}] [${level.toUpperCase()}] [${SESSION_ID}] ${message}`;
+  console[level](formatted, ...args);
+};
 
-// --- Enhanced LocalAuth with Supabase Integration ---
-class EnhancedLocalAuth extends LocalAuth {
-  constructor(options = {}) {
-    super(options);
-    this.supabase = options.supabase;
-    this.sessionId = options.sessionId || 'default';
-    this.retryCount = 0;
-    this.maxRetries = 3;
-    this.client = null; // Add client reference
-    log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
+// --- Enhanced Supabase Store for WhatsApp Session ---
+class SupabaseStore {
+  constructor(supabaseClient, sessionId) {
+    this.supabase = supabaseClient;
+    this.sessionId = sessionId;
+    log('info', `SupabaseStore initialized for session ID: ${this.sessionId}`);
   }
 
-  async _executeWithRetry(operation, fallback = null) {
-    this.retryCount = 0;
-    while (this.retryCount < this.maxRetries) {
-      try {
-        return await operation();
-      } catch (err) {
-        this.retryCount++;
-        log('warn', `Supabase operation failed (attempt ${this.retryCount}/${this.maxRetries}): ${err.message}`);
-        if (this.retryCount >= this.maxRetries) {
-          log('error', `Max retries reached for Supabase operation: ${err.message}`);
-          return fallback;
-        }
-        // Exponential backoff
-        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, this.retryCount)));
+  async sessionExists({ session }) {
+    try {
+      const { count, error } = await this.supabase
+        .from('whatsapp_sessions')
+        .select('*', { count: 'exact', head: true })
+        .eq('session_key', session);
+
+      if (error) {
+        log('error', `Supabase error in sessionExists: ${error.message}`);
+        return false;
       }
+      return count > 0;
+    } catch (err) {
+      log('error', `Exception in sessionExists: ${err.message}`);
+      return false;
     }
   }
 
-  async afterInit(client) {
-    log('info', '🔄 afterInit called - starting session restoration process');
-    
+  async extract() {
     try {
-      // Call parent afterInit but make sure it doesn't block our restoration
-      super.afterInit(client).catch(err => {
-        log('warn', `Parent afterInit error (continuing anyway): ${err.message}`);
-      });
-      
-      // Keep a reference to the client for session extraction
-      this.client = client;
-      
-      log('info', '🔍 Attempting to restore session from Supabase...');
-      
-      // Try to load session from Supabase first
       const { data, error } = await this.supabase
         .from('whatsapp_sessions')
         .select('session_data')
         .eq('session_key', this.sessionId)
-        .maybeSingle(); // Changed from .single() to .maybeSingle()
-      
+        .limit(1)
+        .single();
+
       if (error) {
-        log('warn', `Failed to query session from Supabase: ${error.message}`);
-        return;
+        log('warn', `No existing session found: ${error.message}`);
+        return null;
       }
       
-      if (data?.session_data) {
-        // Check if session data is valid
-        const sessionSize = JSON.stringify(data.session_data).length;
-        if (sessionSize < 5000) {
-          log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
-          return;
-        }
-        
-        log('info', `✅ Found valid session in Supabase (${sessionSize} bytes)`);
-        
-        // Save to local storage with retries
-        let retries = 0;
-        const maxRetries = 3;
-        
-        while (retries < maxRetries) {
-          try {
-            const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
-            if (!fs.existsSync(sessionDir)) {
-              fs.mkdirSync(sessionDir, { recursive: true });
-              log('info', `Created session directory: ${sessionDir}`);
-            }
-            
-            // Make sure to clear any existing session file first
-            const sessionFile = path.join(sessionDir, 'session.json');
-            if (fs.existsSync(sessionFile)) {
-              log('info', 'Removing existing session file before writing new one');
-              fs.unlinkSync(sessionFile);
-            }
-            
-            // Write the session data
-            await fs.promises.writeFile(
-              sessionFile,
-              JSON.stringify(data.session_data),
-              { encoding: 'utf8' }
-            );
-            
-            log('info', '✅ Session restored from Supabase to local storage');
-            
-            // Add a forced delay to ensure proper session loading
-            log('info', '⏳ Waiting 5 seconds for session to be properly applied...');
-            await new Promise(resolve => setTimeout(resolve, 5000));
-            
-            // Verify the file was written correctly
-            const savedContent = await fs.promises.readFile(
-              sessionFile,
-              { encoding: 'utf8' }
-            );
-            
-            if (savedContent && savedContent.length > 5000) {
-              log('info', '✓ Session file verification successful');
-              break; // Success - exit retry loop
-            } else {
-              throw new Error('Session file verification failed');
-            }
-          } catch (writeErr) {
-            retries++;
-            log('warn', `Session restoration attempt ${retries}/${maxRetries} failed: ${writeErr.message}`);
-            
-            if (retries >= maxRetries) {
-              log('error', `❌ Failed to restore session after ${maxRetries} attempts`);
-            } else {
-              // Wait before retry with exponential backoff
-              const delay = 1000 * Math.pow(2, retries);
-              log('info', `⏱️ Waiting ${delay}ms before retry...`);
-              await new Promise(resolve => setTimeout(resolve, delay));
-            }
-          }
-        }
-        
-        // Signal that we've successfully restored the session
-        log('info', '🎉 Session restoration process completed successfully');
-      } else {
-        log('info', '❓ No session data found in Supabase');
-      }
+      log('info', '✅ Session data extracted from Supabase');
+      return data?.session_data || null;
     } catch (err) {
-      log('error', `❌ Error in afterInit: ${err.message}`);
-      log('error', err.stack);
+      log('error', `Exception in extract: ${err.message}`);
+      return null;
     }
   }
-  
-  async save(session) {
-    // Check if session is valid and has sufficient data
-    if (!session || JSON.stringify(session).length < 5000) {
-      log('warn', '⚠️ Session data appears too small or invalid');
-      
-      // Skip trying all other methods and go straight to direct localStorage extraction
-      if (this.client && this.client.pupPage) {
-        try {
-          log('info', 'Attempting direct localStorage extraction as last resort');
-          
-          // Check if page is still responsive
-          const isPageAlive = await this.client.pupPage.evaluate(() => true).catch(() => false);
-          if (!isPageAlive) {
-            log('warn', '⚠️ Puppeteer page is no longer responsive, cannot extract data directly');
-            return;
-          }
-          
-          const rawLocalStorage = await this.client.pupPage.evaluate(() => {
-            const data = {};
-            for (let i = 0; i < localStorage.length; i++) {
-              const key = localStorage.key(i);
-              data[key] = localStorage.getItem(key);
-            }
-            return data;
-          }).catch(err => {
-            log('error', `Direct localStorage evaluation failed: ${err.message}`);
-            return null;
-          });
-          
-          if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
-            session = rawLocalStorage;
-            const newSize = JSON.stringify(session).length;
-            log('info', `Found better session data via direct extraction (${newSize} bytes)`);
-            
-            // Only continue if the extracted data is valid
-            if (newSize < 1000) {
-              log('warn', `Extracted session still too small (${newSize} bytes), aborting save`);
-              return;
-            }
-          } else {
-            log('warn', 'Direct extraction found too few items, aborting save');
-            return;
-          }
-        } catch (e) {
-          log('error', `Last resort extraction failed: ${e.message}`);
-          return;
-        }
-      } else {
-        log('warn', 'No client or pupPage available for extraction, aborting save');
-        return;
-      }
-    }
-    
-    // Save locally using the parent method if available
+
+  async save(sessionData) {
     try {
-      if (typeof super.save === 'function') {
-        await super.save(session);
-      } else {
-        log('warn', 'Parent save method not available, skipping local save');
-        
-        // Try manual save to local storage
-        try {
-          const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
-          if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir, { recursive: true });
-          }
-          
-          await fs.promises.writeFile(
-            path.join(sessionDir, 'session.json'),
-            JSON.stringify(session),
-            { encoding: 'utf8' }
-          );
-          log('info', '✅ Session manually saved to local storage');
-        } catch (writeErr) {
-          log('error', `Failed to manually write session to local storage: ${writeErr.message}`);
-        }
-      }
-    } catch (err) {
-      log('error', `Failed to save session locally: ${err.message}`);
-      // Continue anyway to try Supabase save
-    }
-    
-    // Then save to Supabase
-    try {
-      const sessionSize = JSON.stringify(session).length;
-      log('info', `Saving session to Supabase (${sessionSize} bytes)`);
-      
-      // One final check before saving to Supabase
-      if (sessionSize < 5000) {
-        log('warn', `Session is still too small (${sessionSize} bytes), skipping Supabase save`);
-        return;
-      }
-      
       const { error } = await this.supabase
         .from('whatsapp_sessions')
-        .upsert({
-          session_key: this.sessionId,
-          session_data: session,
+        .upsert({ 
+          session_key: this.sessionId, 
+          session_data: sessionData,
           updated_at: new Date().toISOString()
         }, { onConflict: 'session_key' });
-      
-      if (error) throw new Error(error.message);
-      log('info', '✅ Session saved to Supabase');
-      
-      // Also create a backup copy
-      await this.supabase
-        .from('whatsapp_sessions')
-        .upsert({
-          session_key: `${this.sessionId}_backup`,
-          session_data: session,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'session_key' });
-      
-      log('info', '📥 Created session backup');
+
+      if (error) {
+        log('error', `Failed to save session: ${error.message}`);
+      } else {
+        log('info', '💾 Session saved to Supabase successfully');
+      }
     } catch (err) {
-      log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
+      log('error', `Exception in save: ${err.message}`);
     }
   }
 
   async delete() {
-    // Delete from Supabase
     try {
       const { error } = await this.supabase
         .from('whatsapp_sessions')
         .delete()
         .eq('session_key', this.sessionId);
-      
+
       if (error) {
-        log('error', `Failed to delete session from Supabase: ${error.message}`);
+        log('error', `Failed to delete session: ${error.message}`);
       } else {
-        log('info', '✅ Session deleted from Supabase');
+        log('info', '🗑️ Session deleted from Supabase');
+      }
+    } catch (err) {
+      log('error', `Exception in delete: ${err.message}`);
+    }
+  }
+
+  // Method to extract and backup local session to Supabase
+  async extractLocalSession() {
+    try {
+      const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${this.sessionId}`);
+      
+      if (!fs.existsSync(sessionPath)) {
+        log('warn', 'No local session directory found');
+        return false;
+      }
+
+      // Read session files and create backup
+      const sessionFiles = this.readSessionFiles(sessionPath);
+      if (sessionFiles && Object.keys(sessionFiles).length > 0) {
+        await this.save(sessionFiles);
+        log('info', '📦 Local session extracted and saved to Supabase');
+        return true;
       }
       
-      // Also delete backup if it exists
-      await this.supabase
-        .from('whatsapp_sessions')
-        .delete()
-        .eq('session_key', `${this.sessionId}_backup`);
+      return false;
     } catch (err) {
-      log('error', `Failed to delete session from Supabase: ${err.message}`);
-    }
-    
-    // Delete local session
-    return super.delete();
-  }
-}
-
-let client = null;
-let connectionRetryCount = 0;
-let isClientInitializing = false;
-let currentQRCode = null;
-let lastActivityTime = Date.now();
-let lastBrowserReset = Date.now(); // New variable to track browser resets
-
-// Function to detect if using a business number
-async function detectBusinessAccount(client) {
-  if (!client) return false;
-  
-  try {
-    // Check if business profile function exists
-    if (typeof client.getBusinessProfile !== 'function') {
-      log('info', `Account type detection not supported in this version, assuming regular account`);
+      log('error', `Failed to extract local session: ${err.message}`);
       return false;
     }
-    
-    // Try to access business profile (only available on business accounts)
-    const profile = await client.getBusinessProfile();
-    const isBusinessAcct = Boolean(profile && (profile.description || profile.email || (profile.websites && profile.websites.length > 0)));
-    log('info', `Account type: ${isBusinessAcct ? 'Business 💼' : 'Regular 👤'}`);
-    return isBusinessAcct;
-  } catch (err) {
-    log('warn', `Failed to detect account type: ${err.message}`);
-    return false;
+  }
+
+  readSessionFiles(dirPath) {
+    try {
+      const sessionData = {};
+      const files = fs.readdirSync(dirPath, { withFileTypes: true });
+      
+      for (const file of files) {
+        const filePath = path.join(dirPath, file.name);
+        
+        if (file.isDirectory()) {
+          sessionData[file.name] = this.readSessionFiles(filePath);
+        } else {
+          try {
+            sessionData[file.name] = fs.readFileSync(filePath, 'utf8');
+          } catch (err) {
+            // Skip files that can't be read
+            log('warn', `Could not read file ${filePath}: ${err.message}`);
+          }
+        }
+      }
+      
+      return sessionData;
+    } catch (err) {
+      log('error', `Error reading session files: ${err.message}`);
+      return null;
+    }
   }
 }
 
-// Apply specific optimizations for business accounts
-function applyBusinessOptimizations(client) {
-  if (!client) return;
-  
-  log('info', '🔧 Applying business account optimizations...');
-  
-  // Shorter keepalive intervals for business accounts
-  if (client.options && client.options.webVersionCache) {
-    client.options.webVersionCache.checkInterval = 15000; // 15 seconds
-  }
-  
-  // Different message sending behavior for business accounts
-  // Business accounts need more conservative sending patterns
-  MAX_MESSAGES_PER_HOUR = 70; // Lower limit for business accounts
-  
-  // Other business-specific optimizations here if needed
-  log('info', '✅ Applied business account optimizations');
-}
+const supabaseStore = new SupabaseStore(supabase, SESSION_ID);
+let client = null;
 
-// Optimized WhatsApp client creation
 function createWhatsAppClient() {
-  const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-  const parentDir = path.dirname(sessionPath);
-  
-  // Ensure session directory exists
   try {
+    // Ensure auth folder exists
+    const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+    const parentDir = path.dirname(sessionPath);
     if (!fs.existsSync(parentDir)) {
       fs.mkdirSync(parentDir, { recursive: true });
       log('info', `📁 Created session directory: ${parentDir}`);
     }
+    
+    // Add .gitkeep to ensure folder is tracked
+    const gitkeepPath = path.join(parentDir, '.gitkeep');
+    if (!fs.existsSync(gitkeepPath)) {
+      fs.writeFileSync(gitkeepPath, '');
+      log('info', 'Added .gitkeep to session directory');
+    }
+
+    return new Client({
+      authStrategy: new RemoteAuth({
+        store: supabaseStore,
+        backupSyncIntervalMs: 300000,
+        dataPath: sessionPath,
+      }),
+      puppeteer: {
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu',
+          '--js-flags=--max-old-space-size=256',
+          '--disable-extensions',
+        ],
+        timeout: 120000,
+      },
+      qrTimeout: 90000,
+      restartOnAuthFail: true,
+    });
   } catch (err) {
-    log('error', `Failed to create session directory: ${err.message}`);
-    // Continue anyway as Supabase is the primary storage
+    log('error', `Failed to create WhatsApp client: ${err.message}`);
+    return null;
   }
-
-  return new Client({
-    authStrategy: new EnhancedLocalAuth({
-      supabase: supabase,
-      sessionId: SESSION_ID,
-      dataPath: sessionPath,
-    }),
-    puppeteer: {
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu',
-        '--disable-extensions',
-        '--window-size=1280,720', // Larger viewport helps with business number UI
-        '--disable-features=site-per-process',
-        '--js-flags="--max-old-space-size=512"', // Increased from 300 to 512
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-site-isolation-trials',
-        // Removed --single-process flag as it can cause stability issues
-        '--disable-breakpad', // Disable crash reporting
-        '--disable-component-extensions-with-background-pages', // Reduce memory usage
-      ],
-      defaultViewport: null, // Allow responsive viewport
-      timeout: 180000, // Increased from 120000 to 180000 (3 minutes)
-      protocolTimeout: 90000, // Increased from 60000 to 90000 (1.5 minutes)
-      handleSIGINT: false, // Don't let Puppeteer handle SIGINT, we'll do it ourselves
-      handleSIGTERM: false, // Don't let Puppeteer handle SIGTERM, we'll do it ourselves
-      handleSIGHUP: false, // Don't let Puppeteer handle SIGHUP, we'll do it ourselves
-    },
-    webVersionCache: {
-      type: 'local', // Use local caching for better stability
-      path: path.join(__dirname, '.wwebjs_cache'),
-      lockTimeoutMs: 30000, // 30 second lock timeout
-      maxTimeoutMs: 60000, // 60 second max timeout
-    },
-    qrMaxRetries: 3, // Limit QR code attempts
-    restartOnAuthFail: true,
-    takeoverOnConflict: true,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-    multiDevice: true,
-    sessionCacheEnabled: true, 
-    clearSessionOnLogout: false, // Preserve session on logout
-  });
-}
-
-// Handle Render sleep detection and preparation
-async function handleRenderSleep() {
-  log('info', '💤 Preparing for potential Render sleep...');
-  
-  // Try to save session before sleep
-  if (client && client.authStrategy) {
-    try {
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before potential sleep');
-    } catch (err) {
-      log('error', `Failed to save session before sleep: ${err.message}`);
-    }
-  }
-}
-
-// Function to clear existing invalid session
-async function clearInvalidSession() {
-  log('info', '🧹 Clearing invalid session...');
-  try {
-    if (client && client.authStrategy) {
-      await client.authStrategy.delete();
-      log('info', '🧹 Session cleared via auth strategy');
-    } else {
-      // Fallback to manual deletion
-      const { error } = await supabase
-        .from('whatsapp_sessions')
-        .delete()
-        .eq('session_key', SESSION_ID);
-        
-      if (error) {
-        log('error', `Failed to delete session from Supabase: ${error.message}`);
-      } else {
-        log('info', '🧹 Session deleted from Supabase');
-      }
-      
-      // Also delete backup if it exists
-      await supabase
-        .from('whatsapp_sessions')
-        .delete()
-        .eq('session_key', `${SESSION_ID}_backup`);
-    }
-    
-    // Also clear local session files
-    const sessionPath = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-    if (fs.existsSync(sessionPath)) {
-      try {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-        log('info', '🧹 Local session files cleared');
-      } catch (err) {
-        log('error', `Failed to clear local session files: ${err.message}`);
-      }
-    }
-    
-    return true;
-  } catch (err) {
-    log('error', `Failed to clear invalid session: ${err.message}`);
-    return false;
-  }
-}
-
-// Function to check browser health
-async function checkBrowserHealth(client) {
-  if (!client || !client.pupPage || !client.pupBrowser) {
-    return false;
-  }
-  
-  // If client was just initialized, give it more time to load properly
-  const timeSinceInit = Date.now() - lastActivityTime;
-  if (timeSinceInit < 5 * 60 * 1000) { // 5 minute grace period after initialization
-    try {
-      // Only check if page is responsive during grace period, not if WhatsApp Web is loaded
-      const isPageResponsive = await client.pupPage.evaluate(() => true).catch(() => false);
-      if (isPageResponsive) {
-        return true; // Consider healthy if page is responsive during grace period
-      }
-    } catch (err) {
-      log('warn', `Basic page check failed during grace period: ${err.message}`);
-      return false;
-    }
-  }
-  
-  try {
-    // Check if page is responsive (most important check)
-    const isPageResponsive = await client.pupPage.evaluate(() => true).catch(() => false);
-    if (!isPageResponsive) {
-      log('warn', '⚠️ Puppeteer page is not responsive');
-      return false;
-    }
-    
-    // Check if WhatsApp Web is properly loaded
-    const isWAWebLoaded = await client.pupPage.evaluate(() => {
-      return typeof window.Store !== 'undefined' && window.Store !== null;
-    }).catch(() => false);
-    
-    if (!isWAWebLoaded) {
-      log('warn', '⚠️ WhatsApp Web is not properly loaded');
-      
-      // Check if we're in QR code phase - this is still considered "healthy"
-      if (currentQRCode !== null) {
-        log('info', '🔍 QR code is active, considering browser healthy');
-        return true; // QR code state is normal and healthy
-      }
-      
-      return false;
-    }
-    
-    return true;
-  } catch (err) {
-    log('error', `Browser health check failed: ${err.message}`);
-    return false;
-  }
-}
-
-// New function to periodically reset browser to prevent memory leaks and crashes
-async function performPeriodicBrowserReset() {
-  if (!client || isClientInitializing) {
-    return false;
-  }
-  
-  const BROWSER_RESET_INTERVAL = 8 * 60 * 60 * 1000; // 8 hours
-  const now = Date.now();
-  
-  if (now - lastBrowserReset < BROWSER_RESET_INTERVAL) {
-    return false; // Not time to reset yet
-  }
-  
-  log('info', '🔄 Performing scheduled browser reset to prevent memory issues');
-  
-  // Make sure we save session before the reset
-  if (client && client.authStrategy) {
-    try {
-      await safelyTriggerSessionSave(client);
-      log('info', '📥 Session saved before browser reset');
-    } catch (err) {
-      log('error', `Failed to save session before browser reset: ${err.message}`);
-    }
-  }
-  
-  // Destroy the client and restart
-  if (client) {
-    try {
-      await client.destroy();
-      log('info', '🧹 Client destroyed for scheduled reset');
-    } catch (err) {
-      log('error', `Error destroying client during scheduled reset: ${err.message}`);
-    } finally {
-      client = null;
-    }
-  }
-  
-  // Reset the counter
-  lastBrowserReset = now;
-  
-  // Start client after a short delay
-  setTimeout(startClient, 5000);
-  return true;
 }
 
 function setupClientEvents(c) {
-  if (!c) return;
-  
   c.on('qr', qr => {
-    // Update session state
-    updateSessionState(SESSION_STATES.WAITING_FOR_QR);
-    
-    // Log QR code URL for scanning (this is what you need)
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`;
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}`;
     log('warn', `📱 Scan QR Code: ${qrUrl}`);
-    
-    // Store QR code in memory for web endpoint access
-    currentQRCode = qr;
-    
-    // Reset connection retry count when we get a QR code
-    connectionRetryCount = 0;
-    
-    // Reset activity time to prevent watchdog from restarting during QR scan
-    lastActivityTime = Date.now();
+    qrcode.generate(qr, { small: true });
   });
 
   c.on('ready', async () => {
     log('info', '✅ WhatsApp client is ready.');
-    updateSessionState(SESSION_STATES.CONNECTED);
-    connectionRetryCount = 0; // Reset retry count on successful connection
-    currentQRCode = null; // Clear QR code on ready
     
-    // Force a session save one more time after fully ready
-    setTimeout(async () => {
-      try {
-        await safelyTriggerSessionSave(c);
-        log('info', '📥 Force-saved session after ready state');
-      } catch (err) {
-        log('error', `Failed to force-save session after ready: ${err.message}`);
-      }
-    }, 5000);
-    
-    // Check if this is a business account and apply optimizations
+    // Extract and backup local session after client is ready
     try {
-      isBusinessAccount = await detectBusinessAccount(c);
-      if (isBusinessAccount) {
-        applyBusinessOptimizations(c);
-      }
+      await supabaseStore.extractLocalSession();
     } catch (err) {
-      log('warn', `Failed to detect account type: ${err.message}`);
-    }
-    
-    // Reset activity time
-    lastActivityTime = Date.now();
-    
-    // Force garbage collection if available
-    if (global.gc) {
-      log('info', '🧹 Running garbage collection');
-      global.gc();
+      log('warn', `Failed to backup local session: ${err.message}`);
     }
   });
 
   c.on('authenticated', () => {
     log('info', '🔐 Client authenticated.');
-    updateSessionState(SESSION_STATES.AUTHENTICATED);
-    currentQRCode = null; // Clear QR code once authenticated
-    
-    // Reset activity time
-    lastActivityTime = Date.now();
-    
-    // Try to save session immediately after authentication
-    setTimeout(async () => {
-      try {
-        await safelyTriggerSessionSave(c);
-        log('info', '📥 Forced session save after authentication');
-      } catch (err) {
-        log('error', `Failed to force session save: ${err.message}`);
-      }
-    }, 2000);
+  });
+
+  c.on('remote_session_saved', () => {
+    log('info', '💾 Session saved to Supabase.');
   });
 
   c.on('disconnected', async reason => {
     log('warn', `Client disconnected: ${reason}`);
-    updateSessionState(SESSION_STATES.DISCONNECTED, { reason });
-    currentQRCode = null;
-    
-    // Try to save session before disconnecting if possible
-    if (c.authStrategy?.authState && reason !== 'NAVIGATION') {
-      try {
-        log('info', '📥 Attempting to save session before disconnection');
-        await safelyTriggerSessionSave(c);
-        log('info', '📥 Session saved before disconnection');
-      } catch (err) {
-        log('error', `📥 Failed to save session before disconnection: ${err.message}`);
-      }
-    }
-    
     if (client) {
       try {
         await client.destroy();
       } catch (err) {
-        log('error', `Error destroying client: ${err.message}`);
-      } finally {
-        client = null;
+        log('error', `Error destroying client after disconnect: ${err.message}`);
       }
+      client = null;
     }
     
-    connectionRetryCount++;
-    const delay = Math.min(RECONNECT_DELAY * Math.pow(1.5, Math.min(connectionRetryCount - 1, 5)), 5 * 60 * 1000); // Exponential backoff, cap at 5 minutes
-    log('info', `Will try to reconnect in ${delay/1000} seconds (attempt ${connectionRetryCount})`);
+    // Exponential backoff for reconnection
+    const attemptReconnection = (attempt = 1) => {
+      const delay = Math.min(Math.pow(2, attempt) * 1000, 60000);
+      log('info', `Will attempt reconnection (#${attempt}) in ${delay/1000} seconds`);
+      
+      setTimeout(async () => {
+        try {
+          await startClient();
+          
+          const state = await client?.getState();
+          if (!client || state !== 'CONNECTED') {
+            log('warn', `Reconnection attempt #${attempt} failed. State: ${state || 'No client'}`);
+            attemptReconnection(attempt + 1);
+          } else {
+            log('info', `✅ Reconnected successfully after ${attempt} attempts`);
+          }
+        } catch (err) {
+          log('error', `Error during reconnection attempt #${attempt}: ${err.message}`);
+          attemptReconnection(attempt + 1);
+        }
+      }, delay);
+    };
     
-    setTimeout(startClient, delay);
+    attemptReconnection();
   });
 
-  c.on('auth_failure', async msg => {
-    log('error', `❌ Auth failed: ${msg}. Clearing session.`);
-    updateSessionState(SESSION_STATES.FAILED, { reason: msg });
-    currentQRCode = null;
-    
-    // Clear the session data
-    await clearInvalidSession();
-    
-    // Don't exit - instead try to restart the client after a delay
-    if (client) {
-      try {
-        await client.destroy();
-      } catch (err) {
-        log('error', `Error destroying client on auth failure: ${err.message}`);
-      } finally {
-        client = null;
-      }
+  c.on('auth_failure', async () => {
+    log('error', '❌ Auth failed. Clearing session.');
+    try {
+      await supabaseStore.delete();
+      log('info', 'Session deleted. Will attempt to reinitialize...');
+      client = null;
+      setTimeout(startClient, 10000);
+    } catch (err) {
+      log('error', `Failed to clean up after auth failure: ${err.message}`);
+      process.exit(1);
     }
-    
-    log('info', '🔄 Restarting client after auth failure...');
-    setTimeout(startClient, 30000); // Wait 30 seconds before trying again
   });
 
   c.on('message', handleIncomingMessage);
-  
-  // Additional event handlers for better monitoring
-  c.on('loading_screen', (percent, message) => {
-    // Only log significant loading changes to reduce log noise
-    if (percent === 0 || percent === 100 || percent % 25 === 0) {
-      log('info', `Loading: ${percent}% - ${message}`);
-    }
-    
-    // Reset activity time on loading updates
-    lastActivityTime = Date.now();
-  });
-  
-  c.on('change_state', state => {
-    log('info', `Connection state changed to: ${state}`);
-    
-    // Update activity time on state change
-    lastActivityTime = Date.now();
-    
-    // Try to save session on state change
-    if (state === 'CONNECTED' && c.authStrategy) {
-      try {
-        log('info', '📥 Attempting to save session on state change to CONNECTED');
-        safelyTriggerSessionSave(c);
-      } catch (err) {
-        log('error', `Failed to save session on state change: ${err.message}`);
-      }
-    }
-  });
-  
-  // Add error handler to catch unexpected puppeteer/browser errors
-  if (c.pupBrowser) {
-    c.pupBrowser.on('disconnected', () => {
-      log('warn', '⚠️ Browser disconnected unexpectedly');
-      if (sessionState === SESSION_STATES.CONNECTED) {
-        log('info', 'Browser disconnect detected while connection was active, triggering reconnect');
-        if (client === c) { // Only if this is still the current client
-          setTimeout(() => {
-            if (client === c) { // Double-check
-              client = null;
-              startClient();
-            }
-          }, 5000);
-        }
-      }
-    });
-  }
 }
 
 let messageCount = 0;
-let lastMemoryCheck = 0;
 
-// COMBINED message handler for both workflows
 async function handleIncomingMessage(msg) {
-  try {
-    // Basic validation
-    if (!msg || !msg.from) {
-      log('warn', '⚠️ Received invalid message object');
-      return;
-    }
-    
-    // Only process group messages and direct messages
-    if (!msg.from.endsWith('@g.us') && !msg.from.endsWith('@c.us')) {
-      return;
-    }
-
-    const chatId = msg.from;
-    const senderId = msg.author || msg.from;
-    const text = msg.body || '';
-    
-    // Updated to extract message hash
-    const fullMessageId = msg.id._serialized || '';
-    const messageId = extractMessageHash(fullMessageId);
-    log('info', `📝 Processing message hash: ${messageId} (full: ${fullMessageId})`);
-    
-    // Store the mapping for future reference
-    saveMessageIdMapping(fullMessageId, messageId);
-
-    let replyInfo = null;
-    let hasReply = false;
-
-    // Get quoted message if this is a reply
-    try {
-      const quoted = await msg.getQuotedMessage?.();
-      if (quoted?.id?._serialized) {
-        hasReply = true;
-        const quotedFullId = quoted.id._serialized;
-        const quotedHashId = extractMessageHash(quotedFullId);
-        
-        replyInfo = {
-          message_id: quotedHashId || null,
-          full_message_id: quotedFullId || null,
-          text: quoted?.body || null,
-        };
-        // Store this mapping too
-        saveMessageIdMapping(quotedFullId, quotedHashId);
-        
-        log('info', `📝 Message ${messageId} is replying to message hash ${replyInfo.message_id}`);
-      }
-    } catch (err) {
-      log('warn', `⚠️ Failed to get quoted message: ${err.message}`);
-    }
-
-    // Check for VALUATION keyword
-    const isValuationRelated = 
-      text.toLowerCase().includes('valuation') ||
-      (hasReply && replyInfo?.text?.toLowerCase().includes('valuation'));
-
-    // Check for INTEREST RATE keyword
-    const isInterestRateRelated = 
-      text.toLowerCase().includes('keyquest mortgage team');
-
-    // Skip if no keywords match
-    if (!isValuationRelated && !isInterestRateRelated) {
-      log('info', '🚫 Ignored message (no relevant keywords).');
-      return;
-    }
-
-    // Update activity time when processing messages
-    lastActivityTime = Date.now();
-
-    // Memory usage tracking
-    messageCount++;
-    const now = Date.now();
-    
-    // Only check memory every 50 messages or at least 5 minutes
-    if (messageCount % 50 === 0 || (now - lastMemoryCheck > 5 * 60 * 1000)) {
-      lastMemoryCheck = now;
-      const mem = process.memoryUsage();
-      const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
-      const heapUsedMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
-      const heapTotalMB = (mem.heapTotal / 1024 / 1024).toFixed(1);
-      log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapUsedMB}MB, HeapTotal=${heapTotalMB}MB`);
-
-      // Warning threshold
-      if (parseFloat(rssMB) > MEMORY_THRESHOLD_MB) {
-        log('warn', `⚠️ RSS memory usage above ${MEMORY_THRESHOLD_MB}MB.`);
-        
-        // Force garbage collection if available
-        if (global.gc) {
-          log('info', '🧹 Running forced garbage collection');
-          global.gc();
-        }
-      }
-    }
-
-    // Prepare payload for n8n webhook
-    const payload = {
-      groupId: chatId,
-      senderId,
-      text,
-      messageId: messageId, // This is now just the hash part
-      fullMessageId: fullMessageId, // Keep the full ID for reference
-      hasReply,
-      replyInfo,
-      timestamp: new Date(msg.timestamp * 1000).toISOString(),
-      botVersion: BOT_VERSION,
-    };
-
-    // Send to appropriate webhook based on detected keywords
-    if (isValuationRelated && VALUATION_WEBHOOK_URL) {
-      log('info', '💼 Detected valuation related message');
-      await sendToN8nWebhook(VALUATION_WEBHOOK_URL, payload, 'VALUATION');
-    } 
-    
-    if (isInterestRateRelated && INTEREST_RATE_WEBHOOK_URL) {
-      log('info', '💰 Detected interest rate related message');
-      await sendToN8nWebhook(INTEREST_RATE_WEBHOOK_URL, payload, 'INTEREST_RATE');
-    }
-  } catch (err) {
-    log('error', `Error processing message: ${err.message}`);
-  }
-}
-
-// Improved webhook sender with webhook type parameter and messageId tracking
-async function sendToN8nWebhook(webhookUrl, payload, webhookType, attempt = 0) {
-  if (!webhookUrl) {
-    log('warn', `⚠️ ${webhookType} webhook URL not set. Webhook skipped.`);
+  // Only process messages from group chats
+  if (!msg.from.endsWith('@g.us')) {
     return;
   }
 
-  // Truncate long texts to avoid large payloads
-  if (payload.text?.length > 1000) {
-    payload.text = payload.text.slice(0, 1000) + '... [truncated]';
-  }
-  if (payload.replyInfo?.text?.length > 500) {
-    payload.replyInfo.text = payload.replyInfo.text.slice(0, 500) + '... [truncated]';
+  const groupId = msg.from;
+  const senderId = msg.author || msg.from;
+  const text = msg.body || '';
+  const messageId = msg?.id?.id || msg?.id?._serialized || '';
+
+  let replyInfo = null;
+  let hasReply = false;
+
+  try {
+    const quoted = await msg.getQuotedMessage?.();
+    if (quoted?.id) {
+      hasReply = true;
+      replyInfo = {
+        message_id: quoted?.id?.id || quoted?.id?._serialized || null,
+        text: quoted?.body || null,
+      };
+    }
+  } catch (err) {
+    log('warn', `⚠️ Failed to get quoted message: ${err.message}`);
   }
 
-  // Add webhook type to payload
-  payload.webhookType = webhookType;
-  
-  // Ensure message IDs are clearly labeled
-  if (payload.messageId) {
-    // Save original message ID format - use hash now
-    payload.whatsapp_messageId = payload.fullMessageId;
-    
-    // If this is a reply, create a clear relationship
-    if (payload.hasReply && payload.replyInfo && payload.replyInfo.message_id) {
-      payload.replying_to_messageId = payload.replyInfo.message_id;
-      log('info', `📝 Linking message ${payload.messageId} to original message ${payload.replying_to_messageId}`);
+  // Check for different trigger conditions
+  const isValuationMessage = 
+    text.toLowerCase().includes('valuation') ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('valuation'));
+
+  const isInterestRateMessage = 
+    text.toLowerCase().includes('dear valued partners') ||
+    text.toLowerCase().includes('interest rate') ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('dear valued partners')) ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('interest rate'));
+
+  // Skip if message doesn't match any trigger conditions
+  if (!isValuationMessage && !isInterestRateMessage) {
+    log('info', '🚫 Ignored message - no trigger keywords found.');
+    return;
+  }
+
+  // Memory logging every 50 messages
+  messageCount++;
+  if (messageCount % 50 === 0) {
+    const mem = process.memoryUsage();
+    const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
+    const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
+    log('info', `🧠 Memory usage — RSS: ${rssMB} MB, Heap: ${heapMB} MB`);
+
+    if (parseFloat(rssMB) > 300) {
+      log('warn', '⚠️ RSS memory usage above 300MB. Consider restarting or increasing instance size.');
     }
+  }
+
+  const payload = {
+    groupId,
+    senderId,
+    text,
+    messageId,
+    hasReply,
+    replyInfo,
+    messageType: isValuationMessage ? 'valuation' : 'interest_rate',
+    timestamp: new Date(msg.timestamp * 1000).toISOString(),
+  };
+
+  // Send to appropriate webhook based on message type
+  if (isValuationMessage && VALUATION_WEBHOOK_URL) {
+    await sendToWebhook(VALUATION_WEBHOOK_URL, payload, 'valuation');
+  }
+  
+  if (isInterestRateMessage && INTEREST_RATE_WEBHOOK_URL) {
+    await sendToWebhook(INTEREST_RATE_WEBHOOK_URL, payload, 'interest_rate');
+  }
+
+  // Also send to main N8N webhook if configured
+  if (N8N_WEBHOOK_URL) {
+    await sendToWebhook(N8N_WEBHOOK_URL, payload, 'main');
+  }
+}
+
+async function sendToWebhook(webhookUrl, payload, type = 'unknown', attempt = 0) {
+  if (!webhookUrl) {
+    log('warn', `${type} webhook skipped: URL not set.`);
+    return;
+  }
+
+  // Truncate long texts to prevent payload size issues
+  const processedPayload = { ...payload };
+  if (processedPayload.text?.length > 1000) {
+    processedPayload.text = processedPayload.text.slice(0, 1000) + '... [truncated]';
+  }
+  if (processedPayload.replyInfo?.text?.length > 500) {
+    processedPayload.replyInfo.text = processedPayload.replyInfo.text.slice(0, 500) + '... [truncated]';
   }
 
   // Estimate payload size
-  const payloadSize = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+  const payloadSize = Buffer.byteLength(JSON.stringify(processedPayload), 'utf8');
   if (payloadSize > 90_000) {
-    log('warn', `🚫 Payload too large (${payloadSize} bytes). Skipping ${webhookType} webhook.`);
+    log('warn', `🚫 ${type} payload too large (${payloadSize} bytes). Skipping webhook.`);
     return;
   }
 
   try {
-    // Use exponential backoff for retries
-    const timeout = Math.min(10000 + attempt * 5000, 30000); // Increase timeout with each attempt, max 30s
-    
-    log('info', `📤 Sending ${webhookType} webhook (${payloadSize} bytes)...`);
-    
-    await axios.post(webhookUrl, payload, { 
-      timeout,
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': `WhatsAppBot/${BOT_VERSION}`,
-        'X-Webhook-Type': webhookType
-      },
-      // Add validation to prevent accidental redirect following
-      maxRedirects: 0,
-    });
-    
-    log('info', `✅ ${webhookType} webhook sent successfully`);
+    await axios.post(webhookUrl, processedPayload, { timeout: 10000 });
+    log('info', `✅ ${type} webhook sent (${payloadSize} bytes).`);
   } catch (err) {
-    const status = err.response?.status;
-    const isNetworkError = !status; // axios network errors don't have status
-    
-    // Only retry network errors or 5xx server errors
-    if ((isNetworkError || (status >= 500 && status < 600)) && attempt < 3) {
-      const nextAttempt = attempt + 1;
-      const delayMs = 1000 * Math.pow(2, nextAttempt); // Exponential backoff: 2s, 4s, 8s
-      
-      log('warn', `${webhookType} webhook attempt ${nextAttempt}/3 will retry in ${delayMs/1000}s: ${err.message}`);
-      setTimeout(() => sendToN8nWebhook(webhookUrl, payload, webhookType, nextAttempt), delayMs);
+    log('error', `${type} webhook attempt ${attempt + 1} failed: ${err.message}`);
+    if (attempt < 4) {
+      const backoff = Math.min(Math.pow(2, attempt) * 1000, 15000);
+      log('warn', `Will retry ${type} webhook in ${backoff/1000} seconds...`);
+      setTimeout(() => sendToWebhook(webhookUrl, processedPayload, type, attempt + 1), backoff);
     } else {
-      // Don't retry client errors (4xx) or after max retries
-      const errorContext = status ? `HTTP ${status}` : 'Network error';
-      log('error', `${webhookType} webhook failed after ${attempt + 1} attempt(s): ${errorContext} - ${err.message}`);
+      log('error', `Giving up on ${type} webhook after 5 attempts`);
     }
   }
 }
 
-// Function to check session status in Supabase
-async function checkSessionStatus() {
-  try {
-    log('info', '🔍 Checking WhatsApp session status in Supabase...');
-    
-    // First try to get a count to see if there are multiple entries
-    const { data: countData, error: countError } = await supabase
-      .from('whatsapp_sessions')
-      .select('*', { count: 'exact' })
-      .eq('session_key', SESSION_ID);
-      
-    if (countError) {
-      log('error', `❌ Failed to count sessions: ${countError.message}`);
-      return false;
-    }
-    
-    // If more than one entry exists, delete all of them
-    if (countData && countData.length > 1) {
-      log('warn', `⚠️ Found ${countData.length} session entries with the same key. Cleaning up...`);
-      
-      const { error: deleteError } = await supabase
-        .from('whatsapp_sessions')
-        .delete()
-        .eq('session_key', SESSION_ID);
-        
-      if (deleteError) {
-        log('error', `Failed to delete duplicate sessions: ${deleteError.message}`);
-      } else {
-        log('info', '✅ Duplicate sessions deleted');
-      }
-      
-      return false;
-    }
-    
-    // Now try to get the single session
-    const { data, error } = await supabase
-      .from('whatsapp_sessions')
-      .select('*')
-      .eq('session_key', SESSION_ID)
-      .maybeSingle(); // Use maybeSingle() instead of single()
-    
-    if (error) {
-      log('error', `❌ Failed to check session status: ${error.message}`);
-      return false;
-    }
-    
-    if (!data) {
-      log('info', '❓ No session found in Supabase');
-      
-      // Check for backup session
-      const { data: backupData, error: backupError } = await supabase
-        .from('whatsapp_sessions')
-        .select('*')
-        .eq('session_key', `${SESSION_ID}_backup`)
-        .maybeSingle(); // Use maybeSingle() here too
-        
-      if (!backupError && backupData) {
-        log('info', '🔄 Found backup session, restoring...');
-        
-        // Restore from backup
-        const { error: restoreError } = await supabase
-          .from('whatsapp_sessions')
-          .upsert({
-            session_key: SESSION_ID,
-            session_data: backupData.session_data,
-            updated_at: new Date().toISOString()
-          }, { onConflict: 'session_key' });
-          
-        if (restoreError) {
-          log('error', `Failed to restore from backup: ${restoreError.message}`);
-          return false;
-        }
-        
-        log('info', '✅ Session restored from backup');
-        return true;
-      }
-      
-      return false;
-    }
-    
-    const sessionDataSize = JSON.stringify(data.session_data).length;
-    log('info', `✅ Found session in Supabase (${sessionDataSize} bytes)`);
-    
-    // Session data less than 5000 bytes is almost certainly invalid
-    if (sessionDataSize < 5000) {
-      log('warn', '⚠️ Session data appears to be too small, might be invalid');
-      await clearInvalidSession();
-      return false;
-    }
-    
-    return true;
-  } catch (err) {
-    log('error', `❌ Error checking session status: ${err.message}`);
-    return false;
-  }
-}
-
-async function forceSessionRestoration() {
-  try {
-    log('info', '🔄 Performing forced session restoration attempt');
-    
-    // Get session data directly from Supabase
-    const { data, error } = await supabase
-      .from('whatsapp_sessions')
-      .select('session_data')
-      .eq('session_key', SESSION_ID)
-      .maybeSingle(); // Changed from .single() to .maybeSingle()
-      
-    if (error || !data || !data.session_data) {
-      log('error', `Failed to retrieve session: ${error?.message || 'No data'}`);
-      return false;
-    }
-    
-    // Write it to a file directly
-    const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-    
-    const sessionFile = path.join(sessionDir, 'session.json');
-    await fs.promises.writeFile(
-      sessionFile,
-      JSON.stringify(data.session_data),
-      { encoding: 'utf8' }
-    );
-    
-    log('info', '✅ Force-wrote session data from Supabase');
-    
-    // Verify the file
-    const stats = fs.statSync(sessionFile);
-    log('info', `Session file size: ${stats.size} bytes`);
-    
-    return true;
-  } catch (err) {
-    log('error', `Force restoration failed: ${err.message}`);
-    return false;
-  }
-}
-
-// Improved client starter with mutex to prevent multiple initializations
 async function startClient() {
-  if (isClientInitializing) {
-    log('info', '⏳ Client already initializing, skipping duplicate init.');
-    return;
-  }
-  
   if (client) {
     log('info', '⏳ Client already exists, skipping re-init.');
     return;
   }
 
-  isClientInitializing = true;
-  currentQRCode = null;
-  updateSessionState(SESSION_STATES.INITIALIZING);
+  log('info', '🚀 Starting WhatsApp client...');
+  client = createWhatsAppClient();
   
-  try {
-    // Check if we have a valid session before starting
-    const hasValidSession = await checkSessionStatus();
-    if (!hasValidSession) {
-      log('info', '🔄 No valid session found, starting fresh authentication');
-    } else {
-      log('info', '✅ Valid session found in Supabase, will restore');
-      
-      // IMPORTANT: Pre-create the session directory and file with the content from Supabase
-      // This helps ensure the session is available before WhatsApp-web.js tries to use it
-      try {
-        const { data } = await supabase
-          .from('whatsapp_sessions')
-          .select('session_data')
-          .eq('session_key', SESSION_ID)
-          .maybeSingle(); // Changed from .single() to .maybeSingle()
-          
-        if (data?.session_data) {
-          const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-          if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir, { recursive: true });
-            log('info', `📁 Created session directory: ${sessionDir}`);
-          }
-          
-          const sessionFile = path.join(sessionDir, 'session.json');
-          await fs.promises.writeFile(
-            sessionFile,
-            JSON.stringify(data.session_data),
-            { encoding: 'utf8' }
-          );
-          
-          log('info', '🔑 Pre-loaded session data from Supabase before client initialization');
-        }
-      } catch (err) {
-        log('warn', `⚠️ Failed to pre-load session: ${err.message}`);
-      }
-    }
-    
-    log('info', '🚀 Starting WhatsApp client...');
-    client = createWhatsAppClient();
-    
-    // Ensure auth strategy has client reference with a short delay
-    setTimeout(() => {
-      if (client && client.authStrategy) {
-        client.authStrategy.client = client;
-        log('info', '🔗 Added client reference to auth strategy');
-      }
-    }, 1000);
-    
-    setupClientEvents(client);
-    
-    // Add a longer delay before initialization
-    log('info', '⏱️ Waiting 5 seconds before initialization...');
-    // Add a delay before initialization to ensure session files are properly set up
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    log('info', '🚀 Starting client initialization');
-    
-    // Reset activity time
-    lastActivityTime = Date.now();
-    
-    // Add timeout guard for initialization
-    const initPromise = client.initialize();
-    
-    // Set timeout for initialization
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Client initialization timed out after 3 minutes')), 180000);
-    });
-    
-    // Race between initialization and timeout
-    await Promise.race([initPromise, timeoutPromise]);
-    
-    log('info', '✅ WhatsApp client initialized.');
-    
-    // Reset activity time on successful initialization
-    lastActivityTime = Date.now();
-    
-    // Try to force save session right after successful initialization
-    if (client && client.authStrategy) {
-      try {
-        // Double-check client reference is set
-        if (!client.authStrategy.client) {
-          client.authStrategy.client = client;
-          log('info', '🔗 Set client reference in auth strategy after init');
-        }
-        
-        log('info', '📥 Forcing session save after initialization');
-        await safelyTriggerSessionSave(client);
-        log('info', '📥 Session saved successfully after initialization');
-      } catch (err) {
-        log('error', `📥 Failed to save session after initialization: ${err.message}`);
-      }
-    }
-    
-    // Reset browser reset timer on successful initialization
-    lastBrowserReset = Date.now();
-  } catch (err) {
-    log('error', `❌ WhatsApp client failed to initialize: ${err.message}`);
-    updateSessionState(SESSION_STATES.FAILED, { reason: err.message });
-    
-    if (client) {
-      try {
-        await client.destroy();
-      } catch (destroyErr) {
-        log('error', `Error destroying client after init failure: ${destroyErr.message}`);
-      }
-    }
-    
-    client = null;
-    
-    // Try again after a delay with exponential backoff
-    connectionRetryCount++;
-    const delay = Math.min(RECONNECT_DELAY * Math.pow(1.5, Math.min(connectionRetryCount - 1, 5)), 10 * 60 * 1000); // Cap at 10 minutes
-    log('info', `Will try to initialize again in ${delay/1000} seconds (attempt ${connectionRetryCount})`);
-    setTimeout(startClient, delay);
-  } finally {
-    isClientInitializing = false;
-  }
-}
-
-// Message queue to prevent rate limiting and add human-like behavior
-const messageQueue = [];
-let isProcessingQueue = false;
-let messagesSentLastHour = 0;
-let lastHourReset = Date.now();
-const QUEUE_CHECK_INTERVAL = 2000; // Check queue every 2 seconds
-
-// Improved queue processor that uses our custom media handler
-async function processMessageQueue() {
-  if (isProcessingQueue || messageQueue.length === 0) return;
-  
-  // Check hourly message limit
-  const now = Date.now();
-  if (now - lastHourReset > 60 * 60 * 1000) {
-    // Reset counter after an hour
-    messagesSentLastHour = 0;
-    lastHourReset = now;
-  }
-  
-  // Stop if we've hit the hourly limit
-  if (messagesSentLastHour >= MAX_MESSAGES_PER_HOUR) {
-    log('warn', `⚠️ Hourly message limit reached (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR}). Queue paused.`);
+  if (!client) {
+    log('error', '❌ Failed to create WhatsApp client');
     return;
   }
-  
-  isProcessingQueue = true;
-  
+
+  setupClientEvents(client);
+
   try {
-    const task = messageQueue.shift();
-    const { jid, message, imageUrl, options = {}, callback } = task;
-    
-    // Add human-like random delay (500-2500ms)
-    const delay = 500 + Math.floor(Math.random() * 2000);
-    log('info', `🕒 Adding human-like delay of ${delay}ms before sending message`);
-    await new Promise(resolve => setTimeout(resolve, delay));
-    
-    if (!client || !client.pupPage) {
-      log('error', 'Client not ready when processing queue');
-      messageQueue.unshift(task); // Put the task back at the front
-      return callback({ success: false, error: 'WhatsApp client not ready' });
-    }
-    
-    // Check if Puppeteer page is ready and has WhatsApp Web loaded properly
-    try {
-      // Validate WhatsApp Web is loaded properly by checking a basic element
-      const isReady = await client.pupPage.evaluate(() => {
-        return typeof window.Store !== 'undefined' && window.Store !== null;
-      }).catch(() => false);
-      
-      if (!isReady) {
-        log('warn', '⚠️ WhatsApp Web not fully loaded when trying to send message. Deferring task...');
-        // Requeue the task for later
-        messageQueue.unshift(task);
-        isProcessingQueue = false;
-        setTimeout(processMessageQueue, 10000); // Try again in 10 seconds
-        return;
-      }
-    } catch (pageErr) {
-      log('error', `Failed to check WhatsApp Web readiness: ${pageErr.message}`);
-      // Continue anyway - we'll catch any errors below
-    }
-    
-    let sentMessage;
-    
-    if (imageUrl) {
-      try {
-        log('info', `📤 Preparing to send media from URL: ${imageUrl.substring(0, 100)}...`);
-        
-        // Use our custom media downloader instead of MessageMedia.fromUrl
-        try {
-          const media = await downloadMedia(imageUrl, { 
-            timeout: 30000,
-            maxRetries: 3
-          });
-          
-          log('info', '📤 Sending media message...');
-          sentMessage = await client.sendMessage(jid, media, {
-            caption: message || '',
-            ...options
-          });
-          
-          const fullMessageId = sentMessage.id._serialized;
-          const messageHash = extractMessageHash(fullMessageId);
-          saveMessageIdMapping(fullMessageId, messageHash);
-          
-          log('info', `📤 Media message sent successfully with ID hash: ${messageHash} (full: ${fullMessageId})`);
-          
-          callback({ 
-            success: true, 
-            messageId: messageHash,
-            full_message_id: fullMessageId,
-            message_id: messageHash, 
-            timestamp: new Date().toISOString()
-          });
-        } catch (mediaErr) {
-          log('error', `Media download/send failed: ${mediaErr.message}`);
-          
-          // Fallback to text-only if media sending fails
-          log('info', '📤 Falling back to text-only message');
-          sentMessage = await client.sendMessage(jid, `${message || ''}\n\n[Media could not be sent: ${imageUrl}]`);
-          
-          const fullMessageId = sentMessage.id._serialized;
-          const messageHash = extractMessageHash(fullMessageId);
-          saveMessageIdMapping(fullMessageId, messageHash);
-          
-          callback({ 
-            success: true, 
-            messageId: messageHash,
-            full_message_id: fullMessageId,
-            message_id: messageHash, 
-            timestamp: new Date().toISOString()
-          });
-        }
-      } catch (err) {
-        log('error', `Failed to process media: ${err.message}`);
-        
-        // Try to send a fallback text message
-        try {
-          log('info', '📤 Sending fallback text message without media');
-          sentMessage = await client.sendMessage(jid, `${message || ''}\n\n[Media could not be processed: ${imageUrl}]`);
-          
-          const fullMessageId = sentMessage.id._serialized;
-          const messageHash = extractMessageHash(fullMessageId);
-          saveMessageIdMapping(fullMessageId, messageHash);
-          
-          callback({ 
-            success: true, 
-            messageId: messageHash,
-            full_message_id: fullMessageId,
-            message_id: messageHash, 
-            timestamp: new Date().toISOString()
-          });
-        } catch (textErr) {
-          return callback({ 
-            success: false, 
-            error: `Failed to send even fallback message: ${textErr.message}`,
-            messageId: null,
-            message_id: null
-          });
-        }
-      }
-    } else {
-      // Random typing delay for text messages to appear more human-like
-      try {
-        // Simulate "typing..." for a random duration based on message length
-        const typingTime = Math.min(
-          1000 + (message.length * 20), 
-          7000 // Cap at 7 seconds for very long messages
-        );
-        log('info', `🖊️ Simulating typing for ${Math.round(typingTime/1000)}s`);
-        
-        // Try to simulate typing but don't fail if it doesn't work
-        try {
-          await client.sendMessage(jid, { isTyping: true });
-          await new Promise(resolve => setTimeout(resolve, typingTime));
-          await client.sendMessage(jid, { isTyping: false });
-        } catch (typingErr) {
-          log('warn', `Typing simulation error: ${typingErr.message}`);
-          // Just add a simple delay instead
-          await new Promise(resolve => setTimeout(resolve, Math.min(typingTime, 2000)));
-        }
-        
-        // Send the actual message
-        log('info', '📤 Sending text message...');
-        sentMessage = await client.sendMessage(jid, message, options);
-        
-        const fullMessageId = sentMessage.id._serialized;
-        const messageHash = extractMessageHash(fullMessageId);
-        saveMessageIdMapping(fullMessageId, messageHash);
-        
-        log('info', `📤 Text message sent successfully with ID hash: ${messageHash} (full: ${fullMessageId})`);
-        
-        // Update activity time
-        lastActivityTime = Date.now();
-        messagesSentLastHour++;
-        
-        callback({ 
-          success: true, 
-          messageId: messageHash,
-          full_message_id: fullMessageId,
-          message_id: messageHash, 
-          timestamp: new Date().toISOString()
-        });
-        
-        log('info', `✉️ Message sent from queue (${messagesSentLastHour}/${MAX_MESSAGES_PER_HOUR} this hour, ${messageQueue.length} remaining)`);
-      } catch (err) {
-        // Retry once with a simpler approach if the first attempt fails
-        log('warn', `Message send failed: ${err.message}. Retrying without typing simulation...`);
-        
-        try {
-          // Simple retry without typing simulation
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          sentMessage = await client.sendMessage(jid, message, options);
-          
-          const fullMessageId = sentMessage.id._serialized;
-          const messageHash = extractMessageHash(fullMessageId);
-          saveMessageIdMapping(fullMessageId, messageHash);
-          
-          callback({ 
-            success: true, 
-            messageId: messageHash,
-            full_message_id: fullMessageId,
-            message_id: messageHash, 
-            timestamp: new Date().toISOString()
-          });
-        } catch (retryErr) {
-          return callback({ 
-            success: false, 
-            error: `Failed to send message after retry: ${retryErr.message}`,
-            messageId: null,
-            message_id: null
-          });
-        }
-      }
-    }
+    await client.initialize();
+    log('info', '✅ WhatsApp client initialized.');
   } catch (err) {
-    log('error', `Error processing message from queue: ${err.message}`);
-    if (messageQueue.length > 0) {
-      const task = messageQueue[0];
-      task.callback({ 
-        success: false, 
-        error: err.message,
-        messageId: null,
-        message_id: null
-      });
-      messageQueue.shift();
-    }
-  } finally {
-    isProcessingQueue = false;
-    
-    // Process next item after a small delay
-    if (messageQueue.length > 0) {
-      setTimeout(processMessageQueue, 1000);
-    }
+    log('error', `❌ WhatsApp client failed to initialize: ${err.message}`);
+    client = null;
   }
 }
 
-// Enhanced Express server with basic security
+// Express App Setup
 const app = express();
+app.use(express.json({ limit: '10mb' }));
 
-// Security middleware
-app.use((req, res, next) => {
-  // Add security headers
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
+// Graceful shutdown handling
+const gracefulShutdown = async (signal) => {
+  log('warn', `Received ${signal}. Shutting down gracefully...`);
   
-  // Update activity timestamp to detect Render sleep
-  lastActivityTime = Date.now();
+  server.close(() => {
+    log('info', 'HTTP server closed');
+  });
   
-  next();
-});
-
-// Basic rate limiting
-const requestCounts = new Map();
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 60; // 60 requests per minute
-
-app.use((req, res, next) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  
-  // Clean up old entries
-  if (requestCounts.size > 100) {
-    for (const [key, { timestamp }] of requestCounts.entries()) {
-      if (now - timestamp > RATE_LIMIT_WINDOW) {
-        requestCounts.delete(key);
-      }
+  if (client) {
+    try {
+      log('info', 'Destroying WhatsApp client...');
+      await client.destroy();
+      log('info', 'WhatsApp client destroyed successfully');
+    } catch (err) {
+      log('error', `Error destroying client: ${err.message}`);
     }
   }
   
-  // Check rate limit
-  if (!requestCounts.has(ip)) {
-    requestCounts.set(ip, { count: 1, timestamp: now });
-  } else {
-    const record = requestCounts.get(ip);
-    if (now - record.timestamp > RATE_LIMIT_WINDOW) {
-      // Reset if window expired
-      record.count = 1;
-      record.timestamp = now;
-    } else {
-      record.count++;
-      if (record.count > RATE_LIMIT_MAX) {
-        return res.status(429).json({ 
-          error: 'Too many requests',
-          retry_after: Math.ceil((record.timestamp + RATE_LIMIT_WINDOW - now) / 1000)
-        });
-      }
-    }
-  }
-  
-  next();
+  setTimeout(() => {
+    log('info', 'Exiting process...');
+    process.exit(0);
+  }, 3000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('unhandledRejection', (reason, promise) => {
+  log('error', 'Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-app.use(express.json({ limit: '1mb' })); // Limit request body size
-
-// Public health check endpoint
+// Routes
 app.get('/', (_, res) => {
-  const uptime = Date.now() - startedAt;
   res.status(200).json({
-    status: client ? '✅ Bot running' : '⚠️ Bot initializing',
+    status: '✅ Bot running',
     sessionId: SESSION_ID,
     version: BOT_VERSION,
-    accountType: isBusinessAccount ? 'Business' : 'Regular',
-    sessionState: sessionState,
-    monitoring: {
-      valuation: Boolean(VALUATION_WEBHOOK_URL),
-      interestRate: Boolean(INTEREST_RATE_WEBHOOK_URL)
-    },
-    queue: {
-      length: messageQueue.length,
-      sentThisHour: messagesSentLastHour,
-      limit: MAX_MESSAGES_PER_HOUR
-    },
-    uptimeMinutes: Math.floor(uptime / 60000),
-    uptimeHours: Math.floor(uptime / 3600000),
-    uptimeDays: Math.floor(uptime / 86400000),
+    uptimeMinutes: Math.floor((Date.now() - startedAt) / 60000),
     timestamp: new Date().toISOString(),
-    nodeVersion: process.version,
   });
 });
 
-// Render sleep detection endpoint
-app.post('/prepare-sleep', async (req, res) => {
-  res.status(202).json({
-    success: true,
-    message: 'Preparing for sleep'
-  });
-  
-  await handleRenderSleep();
-});
-
-// QR code access endpoint - access via browser to scan
-app.get('/qr', (req, res) => {
-  if (!currentQRCode) {
-    return res.status(404).send('No QR code available. The bot is either already authenticated or still initializing.');
-  }
-
-  // Generate QR code as HTML
-  res.setHeader('Content-Type', 'text/html');
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>WhatsApp QR Code</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <style>
-        body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
-        img { max-width: 100%; height: auto; }
-        .container { max-width: 500px; margin: 0 auto; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>WhatsApp QR Code</h1>
-        <p>Scan this QR code with WhatsApp to authenticate the bot:</p>
-        <img src="https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(currentQRCode)}&size=300x300" alt="WhatsApp QR Code">
-        <p><small>This QR code will expire when a new one is generated.</small></p>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-// Delete session endpoint to manually clear an invalid session
-app.post('/delete-session', async (req, res) => {
-  try {
-    await clearInvalidSession();
-    
-    res.status(200).json({
-      success: true,
-      message: 'Session deleted successfully'
-    });
-    
-    // Restart client after session deletion
-    if (client) {
-      try {
-        await client.destroy();
-      } catch (err) {
-        log('error', `Error destroying client after session deletion: ${err.message}`);
-      } finally {
-        client = null;
-      }
-    }
-    
-    setTimeout(startClient, 2000);
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-// Session check endpoint
-app.get('/session', async (req, res) => {
-  try {
-    const hasSession = await checkSessionStatus();
-    
-    return res.status(200).json({
-      hasSession,
-      sessionState: sessionState,
-      clientState: client ? await client.getState() : 'not_initialized',
-      isBusinessAccount: isBusinessAccount,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    return res.status(500).json({
-      error: err.message
-    });
-  }
-});
-
-// Modified message status tracking endpoint to handle hash IDs
-app.get('/message/:messageId', async (req, res) => {
-  try {
-    const messageHash = req.params.messageId;
-    
-    if (!messageHash) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing messageId parameter'
-      });
-    }
-    
-    if (!client) {
-      return res.status(503).json({
-        success: false,
-        error: 'WhatsApp client not ready'
-      });
-    }
-    
-    try {
-      // Check browser health before attempting to get message
-      const isBrowserHealthy = await checkBrowserHealth(client);
-      if (!isBrowserHealthy) {
-        return res.status(503).json({
-          success: false,
-          error: 'Browser not healthy, cannot retrieve message status'
-        });
-      }
-      
-      // Need to find the full message ID first by searching through the cache or using the hash
-      log('info', `🔍 Looking for message with hash: ${messageHash}`);
-      let fullMessageId = null;
-      
-      // If the messageHash is already a full ID (contains underscores), use as is
-      if (messageHash.includes('_')) {
-        fullMessageId = messageHash;
-        log('info', `Using provided full message ID: ${fullMessageId}`);
-      } else {
-        // First check the cache
-        fullMessageId = getFullMessageId(messageHash);
-        
-        if (fullMessageId) {
-          log('info', `Found full message ID in cache: ${fullMessageId} for hash: ${messageHash}`);
-        } else {
-          // We need to search recent messages to find the full ID
-          // This is a simplified approach - for production you might need a more robust method
-          try {
-            // Get chats
-            const chats = await client.getChats();
-            
-            for (const chat of chats) {
-              try {
-                // Get recent messages
-                const messages = await chat.fetchMessages({ limit: 50 });
-                
-                // Look for the message with the matching hash
-                const matchingMessage = messages.find(msg => 
-                  extractMessageHash(msg.id._serialized) === messageHash
-                );
-                
-                if (matchingMessage) {
-                  fullMessageId = matchingMessage.id._serialized;
-                  log('info', `Found full message ID: ${fullMessageId} for hash: ${messageHash}`);
-                  // Save to cache for future use
-                  saveMessageIdMapping(fullMessageId, messageHash);
-                  break;
-                }
-              } catch (chatErr) {
-                // Skip errors in individual chats
-                log('warn', `Error fetching messages from chat: ${chatErr.message}`);
-                continue;
-              }
-            }
-          } catch (findErr) {
-            log('error', `Failed to search for message: ${findErr.message}`);
-          }
-        }
-      }
-      
-      if (!fullMessageId) {
-        return res.status(404).json({
-          success: false,
-          error: `Could not find full message ID for hash: ${messageHash}`
-        });
-      }
-      
-      // Try to get message status using the full ID
-      const message = await client.getMessageById(fullMessageId);
-      
-      if (!message) {
-        return res.status(404).json({
-          success: false,
-          error: 'Message not found'
-        });
-      }
-      
-      const quotedMsgId = message._data?.quotedStanzaID ? 
-        extractMessageHash(message._data.quotedStanzaID) : null;
-      
-      return res.status(200).json({
-        success: true,
-        messageId: messageHash,
-        fullMessageId: fullMessageId,
-        status: message.ack || 0, // 0: pending, 1: received, 2: viewed, 3: played (for audio/video)
-        timestamp: new Date(message.timestamp * 1000).toISOString(),
-        from: message.from,
-        to: message.to,
-        hasMedia: Boolean(message.hasMedia),
-        body: message.body,
-        quotedMsgId: quotedMsgId
-      });
-      
-    } catch (err) {
-      return res.status(404).json({
-        success: false,
-        error: `Failed to get message status: ${err.message}`
-      });
-    }
-  } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
-
-// Start queue processor
-setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
-
-// Enhanced message sending endpoint with queue and messageId tracking
+// Enhanced send message endpoint supporting both individual and group chats
 app.post('/send-message', async (req, res) => {
-  // Accept either jid or groupId parameter
-  const jid = req.body.jid || req.body.groupId;
-  const { message, imageUrl, options = {} } = req.body;
+  const { jid, groupId, message, imageUrl } = req.body;
+  
+  // Support both jid and groupId parameters
+  const targetId = jid || groupId;
 
-  if (!jid || (!message && !imageUrl)) {
+  if (!targetId || (!message && !imageUrl)) {
     return res.status(400).json({ 
       success: false, 
-      error: 'Missing jid/groupId or message/imageUrl',
-      received: {
-        jid: req.body.jid,
-        groupId: req.body.groupId,
-        hasMessage: Boolean(message),
-        hasImageUrl: Boolean(imageUrl)
-      }
+      error: 'Missing target ID (jid/groupId) or message content (message/imageUrl)' 
     });
   }
 
   if (!client) {
-    return res.status(503).json({ success: false, error: 'WhatsApp client not ready' });
-  }
-  
-  // Check browser health before adding to queue
-  const isBrowserHealthy = await checkBrowserHealth(client);
-  if (!isBrowserHealthy) {
-    log('warn', '⚠️ Browser health check failed before sending message, initiating restart');
-    
-    // Trigger client restart in the background
-    setTimeout(async () => {
-      if (client) {
-        try {
-          await client.destroy();
-        } catch (err) {
-          log('error', `Error destroying client after health check failure: ${err.message}`);
-        } finally {
-          client = null;
-          startClient();
-        }
-      }
-    }, 1000);
-    
     return res.status(503).json({ 
       success: false, 
-      error: 'WhatsApp browser needs to restart, please retry in 30 seconds'
+      error: 'WhatsApp client not ready' 
     });
   }
-  
-  // Validate URL to prevent request forgery if imageUrl provided
-  if (imageUrl) {
-    try {
-      new URL(imageUrl); // Will throw if invalid URL
-      
-      // Additional validation for image URL
-      if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
-        return res.status(400).json({ success: false, error: 'Invalid imageUrl format - must begin with http:// or https://' });
+
+  try {
+    let formattedId = targetId;
+    
+    // Format ID based on type (group or individual)
+    if (targetId.includes('@g.us')) {
+      // Already a group ID
+      formattedId = targetId;
+    } else if (targetId.includes('@c.us')) {
+      // Already an individual ID
+      formattedId = targetId;
+    } else {
+      // Need to determine if it's a group or individual
+      // If it contains letters, assume it's a group ID that needs @g.us
+      // If it's only numbers, assume it's an individual that needs @c.us
+      if (/[a-zA-Z]/.test(targetId)) {
+        formattedId = targetId.endsWith('@g.us') ? targetId : `${targetId}@g.us`;
+      } else {
+        formattedId = targetId.endsWith('@c.us') ? targetId : `${targetId}@c.us`;
       }
-      
-      // Pre-check if image URL is accessible
+    }
+
+    let sentMessage;
+
+    // Send media if imageUrl provided
+    if (imageUrl) {
       try {
-        const headResponse = await axios.head(imageUrl, { 
-          timeout: 5000,
-          validateStatus: status => status < 400 // Accept any status < 400
+        const media = await MessageMedia.fromUrl(imageUrl);
+        sentMessage = await client.sendMessage(formattedId, media, {
+          caption: message || '',
         });
-        
-        // Log content type for debugging
-        const contentType = headResponse.headers['content-type'] || 'unknown';
-        log('info', `🔍 Image URL content type: ${contentType}`);
-        
-        // If it doesn't appear to be an image/media, warn but continue
-        if (!contentType.startsWith('image/') && 
-            !contentType.startsWith('video/') && 
-            !contentType.includes('application/')) {
-          log('warn', `⚠️ URL may not be valid media (content-type: ${contentType})`);
+        log('info', `📸 Image message sent to ${formattedId}`);
+      } catch (mediaErr) {
+        log('error', `Failed to send image: ${mediaErr.message}`);
+        // Fallback to text message if image fails
+        if (message) {
+          sentMessage = await client.sendMessage(formattedId, message);
+          log('info', `📝 Fallback text message sent to ${formattedId}`);
+        } else {
+          throw mediaErr;
         }
-      } catch (headErr) {
-        // Just log the error but don't block the request - we'll handle this during actual processing
-        log('warn', `⚠️ Failed to pre-validate image URL: ${headErr.message}`);
       }
-    } catch (err) {
-      return res.status(400).json({ success: false, error: 'Invalid imageUrl format' });
-    }
-  }
-  
-  // Check if queue is getting too long
-  if (messageQueue.length >= 50) {
-    return res.status(429).json({ 
-      success: false, 
-      error: 'Message queue too long. Try again later.',
-      queueLength: messageQueue.length
-    });
-  }
-
-  // Wait for the message to be sent and get the message hash
-  try {
-    // Create a promise that resolves when we get the message hash
-    const messageResult = await new Promise((resolve, reject) => {
-      // Add message to queue
-      messageQueue.push({
-        jid,
-        message,
-        imageUrl,
-        options,
-        addedAt: Date.now(),
-        callback: (result) => {
-          // This will be called when the message is actually sent
-          log('info', `Message completed with result: ${result.success ? 'success' : 'failure'}`);
-          
-          if (result.success) {
-            resolve(result);
-          } else {
-            reject(new Error(result.error || 'Failed to send message'));
-          }
-        }
-      });
-      
-      log('info', `📨 Adding message to queue for ${jid} (queue length: ${messageQueue.length})`);
-      
-      // Start processing if not already running
-      if (!isProcessingQueue) {
-        processMessageQueue();
-      }
-    });
-    
-    // When we get here, the message has been sent and we have the message hash
-    return res.status(200).json({
-      success: true,
-      message: 'Message sent successfully',
-      messageId: messageResult.messageId, // This is now the hash
-      fullMessageId: messageResult.full_message_id, // Also return the full ID for reference
-      timestamp: messageResult.timestamp
-    });
-  } catch (err) {
-    // If anything goes wrong, return an error
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Failed to send message'
-    });
-  }
-});
-
-// Get client status endpoint (enhanced)
-app.get('/status', async (req, res) => {
-  try {
-    if (!client) {
-      return res.status(503).json({ 
-        status: 'offline',
-        error: 'Client not initialized',
-        sessionState: sessionState
-      });
-    }
-    
-    // Check browser health
-    const isBrowserHealthy = await checkBrowserHealth(client);
-    
-    let state;
-    try {
-      state = await client.getState();
-    } catch (stateErr) {
-      log('warn', `Failed to get client state: ${stateErr.message}`);
-      state = 'unknown';
-    }
-    
-    const connectionState = client.pupPage ? 'connected' : 'disconnected';
-    const mem = process.memoryUsage();
-    
-    // Check session status
-    const sessionStatus = await checkSessionStatus();
-    
-    // Calculate time since last activity
-    const inactiveTime = Math.floor((Date.now() - lastActivityTime) / 1000);
-    
-    return res.status(200).json({
-      status: state,
-      sessionState: sessionState,
-      connectionState,
-      browserHealth: isBrowserHealthy,
-      connectionRetries: connectionRetryCount,
-      uptime: Math.floor((Date.now() - startedAt) / 1000),
-      inactiveSeconds: inactiveTime,
-      isBusinessAccount: isBusinessAccount,
-      timeSinceLastBrowserReset: Math.floor((Date.now() - lastBrowserReset) / 1000),
-      webhooks: {
-        valuation: Boolean(VALUATION_WEBHOOK_URL),
-        interestRate: Boolean(INTEREST_RATE_WEBHOOK_URL)
-      },
-      messageQueue: {
-        length: messageQueue.length,
-        processing: isProcessingQueue,
-        sentThisHour: messagesSentLastHour,
-        hourlyLimit: MAX_MESSAGES_PER_HOUR
-      },
-      memory: {
-        rss: Math.round(mem.rss / 1024 / 1024),
-        heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
-        heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
-        external: Math.round(mem.external / 1024 / 1024),
-        threshold: MEMORY_THRESHOLD_MB
-      },
-      messagesProcessed: messageCount,
-      needsQrScan: Boolean(currentQRCode),
-      hasSession: sessionStatus,
-      timestamp: new Date().toISOString(),
-      cacheSize: messageIdCache.size
-    });
-  } catch (err) {
-    log('error', `Status check error: ${err.message}`);
-    return res.status(500).json({ 
-      status: 'error',
-      error: err.message,
-      sessionState: sessionState
-    });
-  }
-});
-
-// Force browser health check endpoint
-app.post('/check-browser', async (req, res) => {
-  if (!client) {
-    return res.status(503).json({ 
-      success: false, 
-      error: 'Client not initialized' 
-    });
-  }
-  
-  try {
-    const isHealthy = await checkBrowserHealth(client);
-    
-    if (!isHealthy) {
-      log('warn', '⚠️ Manual browser health check failed, scheduling restart');
-      
-      res.status(200).json({
-        success: true,
-        healthy: false,
-        action: 'restart_scheduled',
-        message: 'Browser health check failed, restart scheduled'
-      });
-      
-      // Schedule restart in background
-      setTimeout(async () => {
-        if (client) {
-          try {
-            await client.destroy();
-          } catch (err) {
-            log('error', `Error destroying client after manual health check: ${err.message}`);
-          } finally {
-            client = null;
-            startClient();
-          }
-        }
-      }, 1000);
     } else {
-      res.status(200).json({
-        success: true,
-        healthy: true,
-        message: 'Browser health check passed'
-      });
+      // Send plain text message
+      sentMessage = await client.sendMessage(formattedId, message);
+      log('info', `📝 Text message sent to ${formattedId}`);
     }
-  } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
-  }
-});
 
-// Force session save endpoint with verification
-app.post('/save-session', async (req, res) => {
-  if (!client || !client.authStrategy) {
-    return res.status(503).json({ 
-      success: false, 
-      error: 'WhatsApp client not ready or not authenticated' 
-    });
-  }
-  
-  try {
-    log('info', '📥 Manual session save requested');
-    const result = await safelyTriggerSessionSave(client);
+    // Return original WhatsApp message ID format
+    const messageId = sentMessage.id?.id || sentMessage.id?._serialized || sentMessage.id;
     
-    if (result) {
-      log('info', '📥 Manual session save completed successfully');
-      
-      // Verify the session was saved to Supabase
-      const { data, error } = await supabase
-        .from('whatsapp_sessions')
-        .select('updated_at')
-        .eq('session_key', SESSION_ID)
-        .maybeSingle();
-      
-      if (error || !data) {
-        log('warn', '⚠️ Session verification failed: Session not found in Supabase');
-        return res.status(500).json({
-          success: false,
-          error: 'Session save verification failed'
-        });
-      }
-      
-      return res.status(200).json({ 
-        success: true, 
-        message: 'Session saved and verified successfully',
-        updated_at: data.updated_at
-      });
-    } else {
-      log('warn', '⚠️ Session save operation did not complete successfully');
-      return res.status(500).json({
-        success: false,
-        error: 'Session save operation did not complete successfully'
-      });
-    }
+    return res.status(200).json({ 
+      success: true, 
+      messageId: messageId,
+      target: formattedId,
+      type: imageUrl ? 'media' : 'text'
+    });
+
   } catch (err) {
-    log('error', `Failed to manually save session: ${err.message}`);
+    log('error', `Failed to send message: ${err.message}`);
     return res.status(500).json({ 
       success: false, 
       error: err.message 
     });
-  }})
-
-// Start the server
-app.listen(PORT, () => {
-  log('info', `✅ Server listening on port ${PORT}`);
+  }
 });
 
-// Start queue processor
-setInterval(processMessageQueue, QUEUE_CHECK_INTERVAL);
+// Session management endpoints
+app.post('/extract-session', async (req, res) => {
+  try {
+    const success = await supabaseStore.extractLocalSession();
+    res.status(200).json({ 
+      success, 
+      message: success ? 'Session extracted and saved to Supabase' : 'No local session found' 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+app.delete('/clear-session', async (req, res) => {
+  try {
+    await supabaseStore.delete();
+    res.status(200).json({ 
+      success: true, 
+      message: 'Session cleared from Supabase' 
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+// Health check endpoint
+app.get('/health', async (_, res) => {
+  try {
+    const clientState = client ? await client.getState() : 'NO_CLIENT';
+    
+    let supabaseStatus = 'UNKNOWN';
+    try {
+      const { error } = await supabase.from('whatsapp_sessions').select('count(*)', { count: 'exact', head: true });
+      supabaseStatus = error ? 'ERROR' : 'CONNECTED';
+    } catch (err) {
+      supabaseStatus = 'ERROR: ' + err.message;
+    }
+    
+    const mem = process.memoryUsage();
+    
+    const health = {
+      status: clientState === 'CONNECTED' && supabaseStatus === 'CONNECTED' ? 'healthy' : 'degraded',
+      version: BOT_VERSION,
+      uptime: {
+        seconds: Math.floor((Date.now() - startedAt) / 1000),
+        readable: formatUptime(Date.now() - startedAt),
+      },
+      whatsapp: {
+        state: clientState,
+        ready: client ? true : false,
+      },
+      supabase: supabaseStatus,
+      system: {
+        memory: {
+          rss: `${(mem.rss / 1024 / 1024).toFixed(1)} MB`,
+          heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`,
+          heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)} MB`,
+        },
+        nodejs: process.version,
+      },
+      webhooks: {
+        n8n: !!N8N_WEBHOOK_URL,
+        valuation: !!VALUATION_WEBHOOK_URL,
+        interest_rate: !!INTEREST_RATE_WEBHOOK_URL,
+      },
+      timestamp: new Date().toISOString(),
+    };
+    
+    res.status(200).json(health);
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: err.message,
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Keep-alive endpoint
+app.get('/ping', (_, res) => {
+  res.status(200).send('pong');
+});
+
+// Start server
+const server = app.listen(PORT, () => {
+  log('info', `🚀 Server started on http://localhost:${PORT}`);
+  log('info', `🤖 Bot Version: ${BOT_VERSION}`);
+  log('info', '💻 Starting WhatsApp client in 3 seconds...');
+  setTimeout(startClient, 3000);
+});
+
+// Watchdog - Monitor client health
+setInterval(async () => {
+  if (!client) {
+    log('warn', '🕵️ Watchdog: client is missing. Restarting...');
+    await startClient();
+    return;
+  }
+
+  try {
+    const state = await client.getState();
+    log('info', `✅ Watchdog: client state is "${state}".`);
+
+    if (state !== 'CONNECTED') {
+      log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
+      await client.destroy();
+      client = null;
+      await startClient();
+    }
+  } catch (err) {
+    log('error', `🚨 Watchdog error during state check: ${err.message}. Restarting...`);
+    client = null;
+    await startClient();
+  }
+}, 5 * 60 * 1000); // every 5 minutes
+
+// Memory monitoring
+const checkMemoryUsage = () => {
+  const mem = process.memoryUsage();
+  const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
+  const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(1);
+  const heapTotalMB = (mem.heapTotal / 1024 / 1024).toFixed(1);
+  
+  log('info', `🧠 Memory: RSS=${rssMB}MB, HeapUsed=${heapMB}MB, HeapTotal=${heapTotalMB}MB`);
+  
+  if (parseFloat(rssMB) > 450) {
+    log('error', '🚨 CRITICAL MEMORY USAGE! Force restarting client...');
+    
+    if (global.gc) {
+      log('warn', 'Forcing garbage collection...');
+      global.gc();
+    }
+    
+    if (client) {
+      (async () => {
+        try {
+          await client.destroy();
+          client = null;
+          log('warn', 'Client destroyed due to memory pressure');
+          setTimeout(startClient, 5000);
+        } catch (err) {
+          log('error', `Failed to restart client: ${err.message}`);
+        }
+      })();
+    }
+  } else if (parseFloat(rssMB) > 350) {
+    log('warn', '⚠️ High memory usage detected');
+    if (global.gc) {
+      log('info', 'Suggesting garbage collection...');
+      global.gc();
+    }
+  }
+};
+
+setInterval(checkMemoryUsage, 5 * 60 * 1000);
+
+// Self-ping mechanism
+let lastPingSent = 0;
+const selfPing = async () => {
+  try {
+    const now = Date.now();
+    if (now - lastPingSent > 4 * 60 * 1000) {
+      lastPingSent = now;
+      const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
+      await axios.get(`${appUrl}/ping`, { timeout: 5000 });
+      log('debug', '🏓 Self-ping successful');
+    }
+  } catch (err) {
+    log('warn', `Self-ping failed: ${err.message}`);
+  }
+};
+
+app.use((req, res, next) => {
+  if (req.path === '/ping') {
+    lastPingSent = Date.now();
+  }
+  next();
+});
+
+setInterval(selfPing, 4 * 60 * 1000);
+
+// Helper function to format uptime
+function formatUptime(ms) {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  
+  return `${days}d ${hours % 24}h ${minutes % 60}m ${seconds % 60}s`;
+}
