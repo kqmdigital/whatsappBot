@@ -20,6 +20,38 @@ const VALUATION_WEBHOOK_URL = process.env.VALUATION_WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
+// --- Human-like Behavior Configuration ---
+const HUMAN_BEHAVIOR = {
+  // Typing speed (characters per minute)
+  TYPING_SPEED_MIN: 150,
+  TYPING_SPEED_MAX: 300,
+  
+  // Delays between actions (milliseconds)
+  MIN_DELAY_BETWEEN_MESSAGES: 2000,
+  MAX_DELAY_BETWEEN_MESSAGES: 8000,
+  
+  // Message chunk settings
+  MAX_MESSAGE_LENGTH: 300,
+  CHUNK_DELAY_MIN: 1000,
+  CHUNK_DELAY_MAX: 3000,
+  
+  // Rate limiting
+  MAX_MESSAGES_PER_MINUTE: 8,
+  MAX_MESSAGES_PER_HOUR: 120,
+  
+  // Presence simulation
+  ONLINE_DURATION_MIN: 30000, // 30 seconds
+  ONLINE_DURATION_MAX: 300000, // 5 minutes
+  OFFLINE_DURATION_MIN: 60000, // 1 minute
+  OFFLINE_DURATION_MAX: 600000, // 10 minutes
+};
+
+// Rate limiting storage
+const rateLimiter = {
+  messageTimestamps: [],
+  lastMessageTime: 0,
+};
+
 console.log('🔍 Loaded Webhook URLs:');
 console.log('- N8N_WEBHOOK_URL:', N8N_WEBHOOK_URL);
 console.log('- INTEREST_RATE_WEBHOOK_URL:', INTEREST_RATE_WEBHOOK_URL);
@@ -37,6 +69,279 @@ const log = (level, message, ...args) => {
   const formatted = `[${timestamp}] [${level.toUpperCase()}] [${SESSION_ID}] ${message}`;
   console[level](formatted, ...args);
 };
+
+// --- Human-like Behavior Utilities ---
+
+/**
+ * Generate random delay within specified range
+ */
+function getRandomDelay(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/**
+ * Calculate typing time based on message length
+ */
+function calculateTypingTime(messageLength) {
+  const speed = getRandomDelay(HUMAN_BEHAVIOR.TYPING_SPEED_MIN, HUMAN_BEHAVIOR.TYPING_SPEED_MAX);
+  const baseTime = (messageLength / speed) * 60 * 1000; // Convert to milliseconds
+  
+  // Add some randomness and ensure minimum time
+  const randomFactor = 0.5 + Math.random(); // 0.5 to 1.5
+  return Math.max(1000, Math.floor(baseTime * randomFactor));
+}
+
+/**
+ * Split long messages into human-like chunks
+ */
+function splitMessageIntoChunks(message, maxLength = HUMAN_BEHAVIOR.MAX_MESSAGE_LENGTH) {
+  if (message.length <= maxLength) {
+    return [message];
+  }
+  
+  const chunks = [];
+  const sentences = message.split(/[.!?]+/).filter(s => s.trim());
+  
+  let currentChunk = '';
+  
+  for (const sentence of sentences) {
+    const trimmedSentence = sentence.trim();
+    if (!trimmedSentence) continue;
+    
+    const sentenceWithPunctuation = trimmedSentence + (message.match(/[.!?]/) ? '.' : '');
+    
+    if ((currentChunk + sentenceWithPunctuation).length <= maxLength) {
+      currentChunk += (currentChunk ? ' ' : '') + sentenceWithPunctuation;
+    } else {
+      if (currentChunk) {
+        chunks.push(currentChunk);
+        currentChunk = sentenceWithPunctuation;
+      } else {
+        // Handle very long sentences
+        const words = sentenceWithPunctuation.split(' ');
+        let wordChunk = '';
+        
+        for (const word of words) {
+          if ((wordChunk + word).length <= maxLength) {
+            wordChunk += (wordChunk ? ' ' : '') + word;
+          } else {
+            if (wordChunk) chunks.push(wordChunk);
+            wordChunk = word;
+          }
+        }
+        
+        if (wordChunk) currentChunk = wordChunk;
+      }
+    }
+  }
+  
+  if (currentChunk) {
+    chunks.push(currentChunk);
+  }
+  
+  return chunks.length > 0 ? chunks : [message];
+}
+
+/**
+ * Check rate limits
+ */
+function checkRateLimit() {
+  const now = Date.now();
+  const oneMinuteAgo = now - 60000;
+  const oneHourAgo = now - 3600000;
+  
+  // Clean old timestamps
+  rateLimiter.messageTimestamps = rateLimiter.messageTimestamps.filter(
+    timestamp => timestamp > oneHourAgo
+  );
+  
+  const messagesLastMinute = rateLimiter.messageTimestamps.filter(
+    timestamp => timestamp > oneMinuteAgo
+  ).length;
+  
+  const messagesLastHour = rateLimiter.messageTimestamps.length;
+  
+  if (messagesLastMinute >= HUMAN_BEHAVIOR.MAX_MESSAGES_PER_MINUTE) {
+    return { allowed: false, reason: 'Rate limit: too many messages per minute' };
+  }
+  
+  if (messagesLastHour >= HUMAN_BEHAVIOR.MAX_MESSAGES_PER_HOUR) {
+    return { allowed: false, reason: 'Rate limit: too many messages per hour' };
+  }
+  
+  // Check minimum delay between messages
+  const timeSinceLastMessage = now - rateLimiter.lastMessageTime;
+  if (timeSinceLastMessage < HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES) {
+    const waitTime = HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES - timeSinceLastMessage;
+    return { allowed: false, reason: 'Rate limit: too fast', waitTime };
+  }
+  
+  return { allowed: true };
+}
+
+/**
+ * Record message for rate limiting
+ */
+function recordMessage() {
+  const now = Date.now();
+  rateLimiter.messageTimestamps.push(now);
+  rateLimiter.lastMessageTime = now;
+}
+
+/**
+ * Simulate human typing behavior
+ */
+async function simulateTyping(chat, message) {
+  try {
+    const typingTime = calculateTypingTime(message.length);
+    const actualTypingTime = Math.min(typingTime, 10000); // Cap at 10 seconds
+    
+    log('info', `🔤 Simulating typing for ${actualTypingTime}ms`);
+    
+    // Start typing indicator
+    await chat.sendStateTyping();
+    
+    // Wait for typing time with some interruptions to make it more realistic
+    const intervals = Math.floor(actualTypingTime / 2000) || 1;
+    const intervalTime = actualTypingTime / intervals;
+    
+    for (let i = 0; i < intervals; i++) {
+      await new Promise(resolve => setTimeout(resolve, intervalTime));
+      if (i < intervals - 1) {
+        // Occasionally stop and start typing again
+        if (Math.random() < 0.3) {
+          await chat.clearState();
+          await new Promise(resolve => setTimeout(resolve, getRandomDelay(200, 800)));
+          await chat.sendStateTyping();
+        }
+      }
+    }
+    
+    // Clear typing state
+    await chat.clearState();
+    
+    // Small delay after typing before sending
+    await new Promise(resolve => setTimeout(resolve, getRandomDelay(300, 1000)));
+    
+  } catch (error) {
+    log('warn', `Failed to simulate typing: ${error.message}`);
+  }
+}
+
+/**
+ * Send message with human-like behavior
+ */
+async function sendHumanLikeMessage(client, targetId, message, options = {}) {
+  const rateCheck = checkRateLimit();
+  
+  if (!rateCheck.allowed) {
+    if (rateCheck.waitTime) {
+      log('info', `⏳ Waiting ${rateCheck.waitTime}ms due to rate limiting`);
+      await new Promise(resolve => setTimeout(resolve, rateCheck.waitTime));
+    } else {
+      throw new Error(rateCheck.reason);
+    }
+  }
+  
+  try {
+    const chat = await client.getChatById(targetId);
+    const messageChunks = splitMessageIntoChunks(message.toString());
+    const sentMessages = [];
+    
+    log('info', `📝 Sending ${messageChunks.length} message chunk(s) to ${targetId}`);
+    
+    for (let i = 0; i < messageChunks.length; i++) {
+      const chunk = messageChunks[i];
+      
+      // Simulate typing for each chunk
+      await simulateTyping(chat, chunk);
+      
+      // Send the message
+      let sentMessage;
+      if (options.media) {
+        sentMessage = await client.sendMessage(targetId, options.media, {
+          caption: chunk,
+          ...options.messageOptions
+        });
+      } else {
+        sentMessage = await client.sendMessage(targetId, chunk, options.messageOptions);
+      }
+      
+      sentMessages.push(sentMessage);
+      recordMessage();
+      
+      // Add delay between chunks (except for the last one)
+      if (i < messageChunks.length - 1) {
+        const chunkDelay = getRandomDelay(
+          HUMAN_BEHAVIOR.CHUNK_DELAY_MIN,
+          HUMAN_BEHAVIOR.CHUNK_DELAY_MAX
+        );
+        log('info', `⏳ Waiting ${chunkDelay}ms between message chunks`);
+        await new Promise(resolve => setTimeout(resolve, chunkDelay));
+      }
+    }
+    
+    // Add random delay after sending all chunks
+    const postMessageDelay = getRandomDelay(
+      HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES,
+      HUMAN_BEHAVIOR.MAX_DELAY_BETWEEN_MESSAGES
+    );
+    
+    setTimeout(() => {
+      log('debug', `💤 Post-message cooldown: ${postMessageDelay}ms`);
+    }, 100);
+    
+    return sentMessages;
+    
+  } catch (error) {
+    log('error', `Failed to send human-like message: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * Simulate human presence patterns
+ */
+function simulatePresence(client) {
+  if (!client || typeof client.sendPresenceUnavailable !== 'function') return;
+  
+  const simulateOnlineOffline = async () => {
+    try {
+      // Random chance to change presence
+      if (Math.random() < 0.3) {
+        const isOnline = Math.random() < 0.7; // 70% chance to be online
+        
+        if (isOnline) {
+          await client.sendPresenceAvailable();
+          const onlineTime = getRandomDelay(
+            HUMAN_BEHAVIOR.ONLINE_DURATION_MIN,
+            HUMAN_BEHAVIOR.ONLINE_DURATION_MAX
+          );
+          log('debug', `👁️ Simulating online presence for ${onlineTime}ms`);
+          
+          setTimeout(async () => {
+            try {
+              await client.sendPresenceUnavailable();
+            } catch (err) {
+              log('warn', `Failed to set unavailable presence: ${err.message}`);
+            }
+          }, onlineTime);
+        }
+      }
+    } catch (error) {
+      log('warn', `Failed to simulate presence: ${error.message}`);
+    }
+  };
+  
+  // Set random intervals for presence simulation
+  const baseInterval = 5 * 60 * 1000; // 5 minutes
+  const randomInterval = getRandomDelay(baseInterval * 0.5, baseInterval * 2);
+  
+  setTimeout(() => {
+    simulateOnlineOffline();
+    simulatePresence(client); // Schedule next simulation
+  }, randomInterval);
+}
 
 // --- Enhanced Session Data Extraction (Modified as per suggestion) ---
 async function extractSessionData(client) {
@@ -111,15 +416,6 @@ async function extractSessionData(client) {
         log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
         return null;
       }
-      
-      // // Validate essential WhatsApp keys (from index (8).js) - Temporarily commented out
-      // const hasWAData = Object.keys(rawLocalStorage).some(key => 
-      //   key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
-      // );
-      // if (!hasWAData) {
-      //   log('warn', 'Session data missing essential WhatsApp keys');
-      //   return null; 
-      // }
       
       log('info', `✅ Valid session data extracted (${sessionSize} bytes)`);
       return rawLocalStorage; // Now, if size is okay, it will return the data
@@ -201,19 +497,12 @@ class SupabaseStore {
 
       // Validate essential session keys
       if (typeof sessionData === 'object' && sessionData !== null) {
-        // This is where SupabaseStore's own validation happens.
-        // If extractSessionData now passes data more leniently, this validation
-        // might still flag it if the specific keys are missing.
-        // Consider if this also needs to be adjusted for consistency with index (5).js's behavior.
         const hasEssentialData = Object.keys(sessionData).some(key => 
           key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
         );
         
         if (!hasEssentialData) {
           log('warn', `Session data exists (from Supabase) but missing essential WhatsApp keys for ${sessionKey}`);
-          // Depending on strictness, you might return null or the data anyway
-          // For now, let's keep it as it was, but be aware this might be the next point of "failure"
-          // if the goal is to accept sessions without these specific keys.
         }
       }
       
@@ -239,9 +528,7 @@ class SupabaseStore {
       const dataSize = JSON.stringify(sessionData).length;
       log('info', `Saving session data (${dataSize} bytes) for ${sessionKey}`);
 
-      // Ensure we have essential WhatsApp data - This check is also present here.
-      // If index (5).js was saving sessions without these specific keys,
-      // this might also need adjustment.
+      // Ensure we have essential WhatsApp data
       const hasEssentialData = Object.keys(sessionData).some(key => 
         key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
       );
@@ -250,18 +537,15 @@ class SupabaseStore {
         log('warn', 'Session data (for saving) missing essential WhatsApp keys, attempting to extract fresh data');
         
         if (this.client) {
-          const freshData = await extractSessionData(this.client); // Uses the modified extractSessionData
-          if (freshData) { // freshData might still be null if the modified extractSessionData fails its own checks (size, item count)
+          const freshData = await extractSessionData(this.client);
+          if (freshData) {
             sessionData = freshData;
             log('info', 'Using fresh extracted session data for save');
-            // Re-check essential data for the *freshly* extracted data if you want to be strict before saving
             const freshHasEssential = Object.keys(sessionData).some(key => 
                 key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
             );
             if (!freshHasEssential) {
                 log('warn', 'Freshly extracted session data also missing essential keys. Saving as is based on size/item count.');
-                // Or, you could choose to not save if even fresh data lacks specific keys.
-                // For now, proceeding to save if size/item count from extractSessionData was okay.
             }
           } else {
             log('warn', 'Fresh extraction for save attempt also yielded no valid data. Aborting save.');
@@ -346,7 +630,7 @@ class SupabaseStore {
       // Read session files and create backup
       const sessionFiles = this.readSessionFiles(sessionPath);
       if (sessionFiles && Object.keys(sessionFiles).length > 0) {
-        await this.save({ sessionData: sessionFiles }); // Uses the modified save
+        await this.save({ sessionData: sessionFiles });
         log('info', '📦 Local session extracted and saved to Supabase');
         return true;
       }
@@ -386,7 +670,6 @@ class SupabaseStore {
   }
 
   // Enhanced session validation
- // Enhanced session validation
   async validateSession(sessionData) {
     if (!sessionData || typeof sessionData !== 'object') {
       log('warn', 'SupabaseStore.validateSession: Session data is null or not an object.');
@@ -400,9 +683,6 @@ class SupabaseStore {
 
     if (!hasRequiredKeys) {
       log('warn', 'SupabaseStore.validateSession: Session data appears to be missing some commonly expected WhatsApp keys. Proceeding with size check.');
-      // We log the warning but don't return false immediately,
-      // to allow sessions that are large enough (like index (5).js might have saved)
-      // to pass this validation stage if that's the desired behavior.
     }
 
     const dataSize = JSON.stringify(sessionData).length;
@@ -421,7 +701,6 @@ async function safelyTriggerSessionSave(client) {
   if (!client) return false;
   
   try {
-    // ... (extractSessionData call and initial checks remain the same) ...
     const sessionData = await extractSessionData(client);
     
     if (sessionData) {
@@ -430,7 +709,7 @@ async function safelyTriggerSessionSave(client) {
       
       const storeFromAuth = client.authStrategy?.store;
       if (storeFromAuth && typeof storeFromAuth.validateSession === 'function') {
-        const isValid = await storeFromAuth.validateSession(sessionData); // Uses the updated validateSession
+        const isValid = await storeFromAuth.validateSession(sessionData);
         if (!isValid) {
           log('warn', 'Session data validation failed by SupabaseStore.validateSession in safelyTriggerSessionSave');
           return false; 
@@ -443,18 +722,15 @@ async function safelyTriggerSessionSave(client) {
         }
       }
       
-      // --- THIS IS THE SAVE LOGIC BLOCK TO UPDATE ---
       if (storeFromAuth && typeof storeFromAuth.save === 'function') {
-        // Ensure client reference is set in the store instance from authStrategy
         if (storeFromAuth.client !== client) {
             log('info', 'Setting client reference in storeFromAuth for saving.');
             storeFromAuth.client = client;
         }
         await storeFromAuth.save({ session: SESSION_ID, sessionData: sessionData });
         log('info', '📥 Session save triggered directly on SupabaseStore (from authStrategy) with valid data');
-      } else if (supabaseStore && typeof supabaseStore.save === 'function') { // Fallback to global supabaseStore
+      } else if (supabaseStore && typeof supabaseStore.save === 'function') {
         log('warn', 'client.authStrategy.store.save not found or invalid, attempting to use global supabaseStore.save()');
-        // Ensure client reference is set in the global store instance
         if (supabaseStore.client !== client) {
             log('info', 'Setting client reference in global supabaseStore for saving.');
             supabaseStore.client = client;
@@ -462,12 +738,11 @@ async function safelyTriggerSessionSave(client) {
         await supabaseStore.save({ session: SESSION_ID, sessionData: sessionData });
         log('info', '📥 Session save triggered on global supabaseStore instance');
       } else {
-        log('error', 'CRITICAL: No save method available on any SupabaseStore instance.'); // Changed to error
+        log('error', 'CRITICAL: No save method available on any SupabaseStore instance.');
         return false;
       }
-      // --- END OF UPDATED SAVE LOGIC BLOCK ---
 
-      // Extra: Create a backup copy of session data directly to file system (this part is fine)
+      // Extra: Create a backup copy of session data directly to file system
       try {
         const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
         if (!fs.existsSync(sessionDir)) {
@@ -519,7 +794,7 @@ function createWhatsAppClient() {
         clientId: SESSION_ID,
         store: supabaseStore,
         backupSyncIntervalMs: 300000, // 5 minutes
-        dataPath: sessionPath, // Local path for cache/backup by RemoteAuth
+        dataPath: sessionPath,
       }),
       puppeteer: {
         headless: true,
@@ -530,15 +805,15 @@ function createWhatsAppClient() {
           '--disable-accelerated-2d-canvas',
           '--no-first-run',
           '--no-zygote',
-          '--single-process', // May reduce memory but can impact stability for some
+          '--single-process',
           '--disable-gpu',
-          '--js-flags=--max-old-space-size=256', // Limit Node's V8 heap size for the process
+          '--js-flags=--max-old-space-size=256',
           '--disable-extensions',
         ],
-        timeout: 120000, // 2 minutes for Puppeteer operations
+        timeout: 120000,
       },
-      qrTimeout: 90000, // 90 seconds for QR scan
-      restartOnAuthFail: true, // Automatically restart client on authentication failure
+      qrTimeout: 90000,
+      restartOnAuthFail: true,
     });
   } catch (err) {
     log('error', `Failed to create WhatsApp client: ${err.message}`);
@@ -559,6 +834,11 @@ function setupClientEvents(c) {
 
   c.on('ready', async () => {
     log('info', '✅ WhatsApp client is ready.');
+    
+    // Start presence simulation after ready
+    setTimeout(() => {
+      simulatePresence(c);
+    }, getRandomDelay(5000, 15000)); // Random delay before starting presence simulation
     
     // Trigger session save after client is ready
     setTimeout(async () => {
@@ -591,36 +871,34 @@ function setupClientEvents(c) {
     log('warn', `Client disconnected: ${reason}`);
     
     // Try to save session before destroying
-    if (client) { // Use the global client variable
+    if (client) {
       try {
-        await safelyTriggerSessionSave(client); // Pass the global client
+        await safelyTriggerSessionSave(client);
         await client.destroy();
       } catch (err) {
         log('error', `Error during disconnect cleanup: ${err.message}`);
       }
-      client = null; // Nullify the global client
+      client = null;
     }
     
     // Exponential backoff for reconnection
     const attemptReconnection = (attempt = 1) => {
-      const delay = Math.min(Math.pow(2, attempt) * 1000, 60000); // Max 1 minute
+      const delay = Math.min(Math.pow(2, attempt) * 1000, 60000);
       log('info', `Will attempt reconnection (#${attempt}) in ${delay/1000} seconds`);
       
       setTimeout(async () => {
         try {
-          // Ensure client is null before starting a new one
           if (client) {
             log('warn', 'Existing client found during reconnection attempt, destroying it first.');
             await client.destroy();
             client = null;
           }
-          await startClient(); // This will re-assign the global client
+          await startClient();
           
-          // Check the state of the new client
           const state = client ? await client.getState() : 'NO_CLIENT';
           if (!client || state !== 'CONNECTED') {
             log('warn', `Reconnection attempt #${attempt} failed. State: ${state}`);
-            if (attempt < 5) { // Limit reconnection attempts
+            if (attempt < 5) {
                 attemptReconnection(attempt + 1);
             } else {
                 log('error', 'Max reconnection attempts reached. Please check network or restart manually.');
@@ -639,7 +917,7 @@ function setupClientEvents(c) {
       }, delay);
     };
     
-    if (reason !== 'NAVIGATION') { // Avoid immediate reconnection loops for navigation issues
+    if (reason !== 'NAVIGATION') {
         attemptReconnection();
     } else {
         log('info', 'Disconnected due to NAVIGATION, manual restart might be needed if it persists.');
@@ -651,17 +929,16 @@ function setupClientEvents(c) {
     try {
       if (c.authStrategy && c.authStrategy.store && typeof c.authStrategy.store.delete === 'function') {
         await c.authStrategy.store.delete({ session: SESSION_ID });
-      } else if (supabaseStore && typeof supabaseStore.delete === 'function') { // Fallback
+      } else if (supabaseStore && typeof supabaseStore.delete === 'function') {
         await supabaseStore.delete({ session: SESSION_ID });
       }
       log('info', 'Session deleted. Will attempt to reinitialize...');
-      if (client === c) { // Ensure we are nullifying the correct client instance
+      if (client === c) {
         client = null;
       }
-      setTimeout(startClient, 10000); // Wait before reinitializing
+      setTimeout(startClient, 10000);
     } catch (err) {
       log('error', `Failed to clean up after auth failure: ${err.message}`);
-      // process.exit(1); // Consider if exiting is desired or if retrying is better
     }
   });
 
@@ -707,7 +984,6 @@ async function handleIncomingMessage(msg) {
 
   // Skip if message doesn't match any trigger conditions
   if (!isValuationMessage && !isInterestRateMessage) {
-    // log('info', '🚫 Ignored message - no trigger keywords found.'); // Optional: reduce log noise
     return;
   }
 
@@ -758,17 +1034,14 @@ async function handleIncomingMessage(msg) {
     await sendToWebhook(INTEREST_RATE_WEBHOOK_URL, payload, 'interest_rate');
   }
 
-  // Also send to main N8N webhook if configured (optional, if it should receive all types)
+  // Also send to main N8N webhook if configured
   if (N8N_WEBHOOK_URL) {
-    // If N8N_WEBHOOK_URL is a general purpose one, send a modified payload or add type
-    // For now, assuming it's okay to send the same payload structure.
     await sendToWebhook(N8N_WEBHOOK_URL, payload, 'main');
   }
 }
 
 async function sendToWebhook(webhookUrl, payload, type = 'unknown', attempt = 0) {
   if (!webhookUrl) {
-    // log('warn', `${type} webhook skipped: URL not set.`); // Optional: reduce log noise
     return;
   }
 
@@ -783,22 +1056,22 @@ async function sendToWebhook(webhookUrl, payload, type = 'unknown', attempt = 0)
 
   // Estimate payload size
   const payloadSize = Buffer.byteLength(JSON.stringify(processedPayload), 'utf8');
-  if (payloadSize > 90_000) { // Limit payload size to ~90KB
+  if (payloadSize > 90_000) {
     log('warn', `🚫 ${type} payload too large (${payloadSize} bytes). Skipping webhook.`);
     return;
   }
 
   try {
-    await axios.post(webhookUrl, processedPayload, { timeout: 10000 }); // 10s timeout
+    await axios.post(webhookUrl, processedPayload, { timeout: 10000 });
     log('info', `✅ ${type} webhook sent (${payloadSize} bytes).`);
   } catch (err) {
     const status = err.response?.status;
-    const isNetworkError = !status; // Axios network errors don't have status
+    const isNetworkError = !status;
     log('error', `${type} webhook attempt ${attempt + 1} failed: ${status ? 'HTTP '+status : err.message}`);
     
     // Retry only for network errors or 5xx server errors
     if ((isNetworkError || (status >= 500 && status < 600)) && attempt < 4) {
-      const backoff = Math.min(Math.pow(2, attempt +1) * 1000, 15000); // Exponential backoff: 2s, 4s, 8s, 15s
+      const backoff = Math.min(Math.pow(2, attempt +1) * 1000, 15000);
       log('warn', `Will retry ${type} webhook in ${backoff/1000} seconds...`);
       setTimeout(() => sendToWebhook(webhookUrl, processedPayload, type, attempt + 1), backoff);
     } else {
@@ -810,12 +1083,6 @@ async function sendToWebhook(webhookUrl, payload, type = 'unknown', attempt = 0)
 async function startClient() {
   if (client) {
     log('info', '⏳ Client already exists or is initializing, skipping re-init.');
-    // Optional: check client state and decide if re-init is needed
-    // const state = await client.getState().catch(() => null);
-    // if (state === 'CONNECTED' || state === 'OPENING') return;
-    // log('warn', 'Existing client not in a good state, attempting to destroy and restart.');
-    // await client.destroy().catch(err => log('error', `Error destroying existing client: ${err.message}`));
-    // client = null;
     return;
   }
 
@@ -824,11 +1091,10 @@ async function startClient() {
   
   if (!newClient) {
     log('error', '❌ Failed to create WhatsApp client instance. Will retry later.');
-    // Schedule a retry if client creation fails
-    setTimeout(startClient, 30000); // Retry after 30 seconds
+    setTimeout(startClient, 30000);
     return;
   }
-  client = newClient; // Assign to global client variable
+  client = newClient;
 
   setupClientEvents(client);
 
@@ -840,14 +1106,14 @@ async function startClient() {
     if (client) {
         await client.destroy().catch(destroyErr => log('error', `Error destroying client after init failure: ${destroyErr.message}`));
     }
-    client = null; // Nullify on failure
-    setTimeout(startClient, 30000); // Retry initialization after a delay
+    client = null;
+    setTimeout(startClient, 30000);
   }
 }
 
 // Express App Setup
 const app = express();
-app.use(express.json({ limit: '10mb' })); // Increased limit for potential large base64 images if ever used
+app.use(express.json({ limit: '10mb' }));
 
 // Graceful shutdown handling
 const gracefulShutdown = async (signal) => {
@@ -874,14 +1140,13 @@ const gracefulShutdown = async (signal) => {
   setTimeout(() => {
     log('info', 'Exiting process...');
     process.exit(0);
-  }, 3000); // Allow 3 seconds for cleanup
+  }, 3000);
 };
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('unhandledRejection', (reason, promise) => {
   log('error', 'Unhandled Rejection at:', promise, 'reason:', reason);
-  // Consider if a restart or specific error handling is needed here
 });
 
 // Routes
@@ -892,10 +1157,18 @@ app.get('/', (_, res) => {
     version: BOT_VERSION,
     uptimeMinutes: Math.floor((Date.now() - startedAt) / 60000),
     timestamp: new Date().toISOString(),
+    humanBehavior: {
+      rateLimits: {
+        messagesPerMinute: HUMAN_BEHAVIOR.MAX_MESSAGES_PER_MINUTE,
+        messagesPerHour: HUMAN_BEHAVIOR.MAX_MESSAGES_PER_HOUR,
+      },
+      messageSplitting: HUMAN_BEHAVIOR.MAX_MESSAGE_LENGTH,
+      typingSimulation: true,
+    }
   });
 });
 
-// Enhanced send message endpoint supporting both individual and group chats
+// Enhanced send message endpoint with human-like behavior
 app.post('/send-message', async (req, res) => {
   const { jid, groupId, message, imageUrl } = req.body;
   
@@ -925,27 +1198,20 @@ app.post('/send-message', async (req, res) => {
     return res.status(503).json({ success: false, error: `Error getting client state: ${stateErr.message}` });
   }
 
-
   try {
     let formattedId = targetIdInput.trim();
     
     // Basic validation and formatting for ID
     if (!formattedId.includes('@')) {
-        // If it's numeric and doesn't have @c.us or @g.us, assume it's a phone number for individual chat
-        // Or if it's alphanumeric without @g.us, assume it's a group ID
         if (/^\d+$/.test(formattedId)) {
             formattedId = `${formattedId}@c.us`;
-        } else if (/^[a-zA-Z0-9-]+$/.test(formattedId)) { // Basic check for group-like ID
+        } else if (/^[a-zA-Z0-9-]+$/.test(formattedId)) {
             formattedId = `${formattedId}@g.us`;
         } else {
-            // If it's more complex, let whatsapp-web.js handle it or throw error
-            // For now, assume it might be correctly formatted if it contains non-numeric chars and no @
-            // This part can be improved with more specific validation if needed.
             if (!formattedId.endsWith('@g.us') && !formattedId.endsWith('@c.us')) {
-                 // Heuristic: if it has a hyphen, more likely a group
                 if (formattedId.includes('-')) {
                     formattedId = `${formattedId}@g.us`;
-                } else { // Default to c.us if unsure and not clearly a group pattern
+                } else {
                     formattedId = `${formattedId}@c.us`;
                 }
             }
@@ -954,52 +1220,74 @@ app.post('/send-message', async (req, res) => {
         return res.status(400).json({ success: false, error: 'Invalid JID format: must end with @c.us or @g.us if @ is present' });
     }
 
-
-    let sentMessage;
-
+    let sentMessages;
+    
+    // Prepare message options for human-like sending
+    const messageOptions = {};
+    
     // Send media if imageUrl provided
     if (imageUrl) {
       try {
         log('info', `Attempting to send media from URL: ${imageUrl} to ${formattedId}`);
-        const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true }); // unsafeMime for flexibility
-        sentMessage = await client.sendMessage(formattedId, media, {
-          caption: message || '',
+        const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
+        
+        sentMessages = await sendHumanLikeMessage(client, formattedId, message || '', {
+          media: media,
+          messageOptions: messageOptions
         });
-        log('info', `📸 Image message sent to ${formattedId}`);
+        
+        log('info', `📸 Image message sent to ${formattedId} with human-like behavior`);
       } catch (mediaErr) {
         log('error', `Failed to send image to ${formattedId}: ${mediaErr.message}`);
         // Fallback to text message if image fails and message content exists
         if (message) {
           log('info', `Falling back to text message for ${formattedId}`);
-          sentMessage = await client.sendMessage(formattedId, `${message}\n\n[Media could not be sent: ${imageUrl}]`);
-          log('info', `📝 Fallback text message sent to ${formattedId}`);
+          const fallbackMessage = `${message}\n\n[Media could not be sent: ${imageUrl}]`;
+          sentMessages = await sendHumanLikeMessage(client, formattedId, fallbackMessage, { messageOptions });
+          log('info', `📝 Fallback text message sent to ${formattedId} with human-like behavior`);
         } else {
-          // If no text message to fallback to, rethrow the media error or return error
           return res.status(500).json({ success: false, error: `Failed to send media and no fallback text: ${mediaErr.message}` });
         }
       }
     } else {
-      // Send plain text message
-      sentMessage = await client.sendMessage(formattedId, message);
-      log('info', `📝 Text message sent to ${formattedId}`);
+      // Send plain text message with human-like behavior
+      sentMessages = await sendHumanLikeMessage(client, formattedId, message, { messageOptions });
+      log('info', `📝 Text message sent to ${formattedId} with human-like behavior`);
     }
 
-    // Return original WhatsApp message ID format
-    const messageId = sentMessage.id?.id || sentMessage.id?._serialized || sentMessage.id;
+    // Return information about sent messages
+    const messageIds = sentMessages.map(msg => msg.id?.id || msg.id?._serialized || msg.id);
     
     return res.status(200).json({ 
       success: true, 
-      messageId: messageId,
+      messageIds: messageIds,
+      messageCount: sentMessages.length,
       target: formattedId,
-      type: imageUrl ? 'media' : 'text'
+      type: imageUrl ? 'media' : 'text',
+      humanBehavior: {
+        chunked: sentMessages.length > 1,
+        typingSimulated: true,
+        rateLimited: true
+      }
     });
 
   } catch (err) {
     log('error', `Failed to send message: ${err.message}`);
-    // Check for common errors like "Evaluation failed: Error: Chat not found"
+    
+    // Handle rate limiting errors specifically
+    if (err.message.includes('Rate limit')) {
+      return res.status(429).json({ 
+        success: false, 
+        error: err.message,
+        retryAfter: Math.ceil(HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES / 1000)
+      });
+    }
+    
+    // Check for common errors like "Chat not found"
     if (err.message && err.message.includes("Chat not found")) {
         return res.status(404).json({ success: false, error: `Chat not found for ID: ${targetIdInput}`});
     }
+    
     return res.status(500).json({ 
       success: false, 
       error: err.message 
@@ -1017,9 +1305,8 @@ app.post('/extract-session', async (req, res) => {
     if (client && typeof client.getState === 'function') {
       const state = await client.getState().catch(() => null);
       if (state === 'CONNECTED') {
-        const extractedData = await extractSessionData(client); // Uses modified extractSessionData
+        const extractedData = await extractSessionData(client);
         if (extractedData) {
-          // Validate with SupabaseStore's own validation if needed before saving
           const isValidForStore = supabaseStore.validateSession ? await supabaseStore.validateSession(extractedData) : true;
           if (isValidForStore) {
             await supabaseStore.save({ session: SESSION_ID, sessionData: extractedData });
@@ -1043,12 +1330,12 @@ app.post('/extract-session', async (req, res) => {
     // Fallback to local files if live extraction failed or wasn't possible
     if (!success) {
       log('info', 'Attempting to extract session from local files as fallback.');
-      const localExtractSuccess = await supabaseStore.extractLocalSession(); // This will use the store's save method
+      const localExtractSuccess = await supabaseStore.extractLocalSession();
       if (localExtractSuccess) {
         success = true;
         message = 'Local session files extracted and saved to Supabase.';
         log('info', message);
-      } else if (success) { // if live extraction was successful but somehow this part is reached
+      } else if (success) {
         // retain the success message
       } else {
         message = 'Failed to extract session from live client or local files.';
@@ -1103,7 +1390,7 @@ app.post('/save-session', async (req, res) => {
         return res.status(503).json({ success: false, error: `Client not connected (state: ${state}). Cannot save session.` });
     }
 
-    const success = await safelyTriggerSessionSave(client); // Uses modified safelyTriggerSessionSave
+    const success = await safelyTriggerSessionSave(client);
     res.status(200).json({
       success,
       message: success ? 'Session save triggered successfully' : 'Failed to trigger session save'
@@ -1124,7 +1411,6 @@ app.get('/health', async (_, res) => {
     
     let supabaseStatus = 'UNKNOWN';
     try {
-      // More robust check: try to select a single, small piece of data or metadata
       const { error } = await supabase.from('whatsapp_sessions').select('session_key').limit(1);
       supabaseStatus = error ? `ERROR (${error.message})` : 'CONNECTED';
     } catch (err) {
@@ -1132,6 +1418,19 @@ app.get('/health', async (_, res) => {
     }
     
     const mem = process.memoryUsage();
+    
+    // Calculate current rate limit status
+    const now = Date.now();
+    const oneMinuteAgo = now - 60000;
+    const oneHourAgo = now - 3600000;
+    
+    rateLimiter.messageTimestamps = rateLimiter.messageTimestamps.filter(
+      timestamp => timestamp > oneHourAgo
+    );
+    
+    const messagesLastMinute = rateLimiter.messageTimestamps.filter(
+      timestamp => timestamp > oneMinuteAgo
+    ).length;
     
     const health = {
       status: clientState === 'CONNECTED' && supabaseStatus === 'CONNECTED' ? 'healthy' : 'degraded',
@@ -1142,7 +1441,6 @@ app.get('/health', async (_, res) => {
       },
       whatsapp: {
         state: clientState,
-        // ready: client ? true : false, // 'ready' is vague, state is better
       },
       supabase: supabaseStatus,
       system: {
@@ -1157,6 +1455,18 @@ app.get('/health', async (_, res) => {
         n8n: !!N8N_WEBHOOK_URL,
         valuation: !!VALUATION_WEBHOOK_URL,
         interest_rate: !!INTEREST_RATE_WEBHOOK_URL,
+      },
+      humanBehavior: {
+        rateLimits: {
+          messagesPerMinute: `${messagesLastMinute}/${HUMAN_BEHAVIOR.MAX_MESSAGES_PER_MINUTE}`,
+          messagesPerHour: `${rateLimiter.messageTimestamps.length}/${HUMAN_BEHAVIOR.MAX_MESSAGES_PER_HOUR}`,
+        },
+        features: {
+          typingSimulation: true,
+          messageChunking: true,
+          presenceSimulation: true,
+          randomDelays: true,
+        }
       },
       timestamp: new Date().toISOString(),
     };
@@ -1176,29 +1486,62 @@ app.get('/ping', (_, res) => {
   res.status(200).send('pong');
 });
 
+// Rate limit info endpoint
+app.get('/rate-limit-status', (_, res) => {
+  const now = Date.now();
+  const oneMinuteAgo = now - 60000;
+  const oneHourAgo = now - 3600000;
+  
+  // Clean old timestamps
+  rateLimiter.messageTimestamps = rateLimiter.messageTimestamps.filter(
+    timestamp => timestamp > oneHourAgo
+  );
+  
+  const messagesLastMinute = rateLimiter.messageTimestamps.filter(
+    timestamp => timestamp > oneMinuteAgo
+  ).length;
+  
+  const timeSinceLastMessage = now - rateLimiter.lastMessageTime;
+  
+  res.status(200).json({
+    messagesLastMinute: messagesLastMinute,
+    maxMessagesPerMinute: HUMAN_BEHAVIOR.MAX_MESSAGES_PER_MINUTE,
+    messagesLastHour: rateLimiter.messageTimestamps.length,
+    maxMessagesPerHour: HUMAN_BEHAVIOR.MAX_MESSAGES_PER_HOUR,
+    timeSinceLastMessage: timeSinceLastMessage,
+    minDelayBetweenMessages: HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES,
+    canSendMessage: timeSinceLastMessage >= HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES &&
+                   messagesLastMinute < HUMAN_BEHAVIOR.MAX_MESSAGES_PER_MINUTE &&
+                   rateLimiter.messageTimestamps.length < HUMAN_BEHAVIOR.MAX_MESSAGES_PER_HOUR,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Start server
-let server; // Define server variable for graceful shutdown
+let server;
 
 const main = async () => {
-    // Attempt to start client first
     await startClient();
 
     server = app.listen(PORT, () => {
       log('info', `🚀 Server started on http://localhost:${PORT}`);
-      log('info', `🤖 Bot Version: ${BOT_VERSION}`);
-      // No need to call startClient() here again if main calls it
+      log('info', `🤖 Bot Version: ${BOT_VERSION} with Human-like Behavior`);
+      log('info', `👤 Human Behavior Features:`);
+      log('info', `   - Typing simulation: ${HUMAN_BEHAVIOR.TYPING_SPEED_MIN}-${HUMAN_BEHAVIOR.TYPING_SPEED_MAX} CPM`);
+      log('info', `   - Rate limiting: ${HUMAN_BEHAVIOR.MAX_MESSAGES_PER_MINUTE}/min, ${HUMAN_BEHAVIOR.MAX_MESSAGES_PER_HOUR}/hour`);
+      log('info', `   - Message chunking: ${HUMAN_BEHAVIOR.MAX_MESSAGE_LENGTH} chars max`);
+      log('info', `   - Random delays: ${HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES}-${HUMAN_BEHAVIOR.MAX_DELAY_BETWEEN_MESSAGES}ms`);
     });
 };
 
 main();
-
 
 // Enhanced Watchdog - Monitor client health and save session periodically
 const watchdogInterval = 5 * 60 * 1000; // 5 minutes
 setInterval(async () => {
   if (!client || typeof client.getState !== 'function') {
     log('warn', '🕵️ Watchdog: client is missing or invalid. Attempting to restart...');
-    await startClient(); // This will handle null client or create new
+    await startClient();
     return;
   }
 
@@ -1209,12 +1552,12 @@ setInterval(async () => {
     if (state === 'CONNECTED') {
       // Periodically save session when connected
       try {
-        await safelyTriggerSessionSave(client); // Uses modified safelyTriggerSessionSave
+        await safelyTriggerSessionSave(client);
         log('info', '💾 Watchdog: Periodic session save completed');
       } catch (saveErr) {
         log('warn', `Watchdog: Periodic session save failed: ${saveErr.message}`);
       }
-    } else if (state !== 'OPENING' && state !== 'PAIRING' && state !== 'UNPAIRED') { // Avoid restarting if it's in a transient startup state
+    } else if (state !== 'OPENING' && state !== 'PAIRING' && state !== 'UNPAIRED') {
       log('warn', `⚠️ Watchdog detected non-ideal state "${state}". Attempting to restart client...`);
       await client.destroy().catch(err => log('error', `Watchdog: Error destroying client: ${err.message}`));
       client = null;
@@ -1253,23 +1596,21 @@ setInterval(() => {
     if (client) {
       (async () => {
         try {
-          await safelyTriggerSessionSave(client); // Attempt to save session
+          await safelyTriggerSessionSave(client);
           await client.destroy();
           client = null;
           log('warn', 'Client destroyed due to memory pressure. Restarting...');
-          setTimeout(startClient, 5000); // Restart after a short delay
+          setTimeout(startClient, 5000);
         } catch (err) {
           log('error', `Failed to properly restart client after memory pressure: ${err.message}`);
-          // Fallback: hard exit if client restart fails, to allow process manager to restart everything
           process.exit(1);
         }
       })();
     } else {
-        // If client is already null, just try to start it
         log('warn', 'Client was null during memory pressure restart. Attempting to start.');
         setTimeout(startClient, 5000);
     }
-  } else if (parseFloat(rssMB) > memoryThresholdMB * 0.8) { // Warn at 80% of threshold
+  } else if (parseFloat(rssMB) > memoryThresholdMB * 0.8) {
     log('warn', `⚠️ High memory usage detected (RSS ${rssMB}MB).`);
     if (global.gc) {
       log('info', 'Suggesting garbage collection due to high memory...');
@@ -1278,20 +1619,19 @@ setInterval(() => {
   }
 }, memoryCheckInterval);
 
-// Self-ping mechanism (if APP_URL is set, e.g., for Render free tier)
+// Self-ping mechanism
 const appUrl = process.env.APP_URL;
 if (appUrl) {
     const selfPingInterval = 4 * 60 * 1000; // 4 minutes
     setInterval(async () => {
       try {
         await axios.get(`${appUrl}/ping`, { timeout: 10000 });
-        log('debug', '🏓 Self-ping successful'); // Use debug for less noise
+        log('debug', '🏓 Self-ping successful');
       } catch (err) {
         log('warn', `Self-ping to ${appUrl}/ping failed: ${err.message}`);
       }
     }, selfPingInterval);
 }
-
 
 // Helper function to format uptime
 function formatUptime(ms) {
