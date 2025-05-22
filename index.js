@@ -39,12 +39,13 @@ const log = (level, message, ...args) => {
 };
 
 // --- Enhanced Session Data Extraction ---
+// --- Enhanced Session Data Extraction (for index (8).js) ---
 async function extractSessionData(client) {
   if (!client || !client.pupPage) {
     log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
     return null;
   }
-  
+
   try {
     // Check if page is still usable
     try {
@@ -57,8 +58,8 @@ async function extractSessionData(client) {
       log('warn', `⚠️ Error checking page status: ${pageErr.message}`);
       return null;
     }
-    
-    // Enhanced localStorage extraction 
+
+    // Enhanced localStorage extraction
     const rawLocalStorage = await client.pupPage.evaluate(() => {
       try {
         // First, verify WAWebJS has properly loaded
@@ -66,26 +67,26 @@ async function extractSessionData(client) {
           console.error("WhatsApp Web Store not initialized");
           return { error: "Store not initialized" };
         }
-        
+
         // Extract ALL localStorage data comprehensively
         const data = {};
         for (let i = 0; i < localStorage.length; i++) {
           const key = localStorage.key(i);
           data[key] = localStorage.getItem(key);
         }
-        
+
         // Add additional WAWebJS-specific session data if available
         if (window.Store && window.Store.AppState) {
           data['WAWebJS_AppState'] = JSON.stringify(window.Store.AppState.serialize());
         }
         
-        // Add session metadata
+        // Add session metadata (from original index (8).js)
         data['_session_metadata'] = JSON.stringify({
           timestamp: Date.now(),
           userAgent: navigator.userAgent,
           url: window.location.href
         });
-        
+
         return data;
       } catch (e) {
         console.error("Error extracting localStorage:", e);
@@ -95,26 +96,27 @@ async function extractSessionData(client) {
       log('warn', `⚠️ Error during page evaluation: ${err.message}`);
       return { error: err.message };
     });
-    
+
     if (rawLocalStorage && rawLocalStorage.error) {
       log('warn', `⚠️ Error in page extraction: ${rawLocalStorage.error}`);
       return null;
     }
-    
-    if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
+
+    // Check if enough items were extracted
+    if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) { // Min items check
       log('info', `🔍 Extracted raw localStorage with ${Object.keys(rawLocalStorage).length} items`);
-      
-      // Validate session size and content
+
+      // Validate session size (common check in both files)
       const sessionSize = JSON.stringify(rawLocalStorage).length;
-      const hasWAData = Object.keys(rawLocalStorage).some(key => 
-        key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
-      );
-      
       if (sessionSize < 5000) {
         log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
         return null;
       }
       
+      // Validate essential WhatsApp keys (from index (8).js)
+      const hasWAData = Object.keys(rawLocalStorage).some(key => 
+        key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
+      );
       if (!hasWAData) {
         log('warn', 'Session data missing essential WhatsApp keys');
         return null;
@@ -122,10 +124,11 @@ async function extractSessionData(client) {
       
       log('info', `✅ Valid session data extracted (${sessionSize} bytes)`);
       return rawLocalStorage;
+      
     } else {
       log('warn', 'localStorage extraction found too few items');
     }
-    
+
     return null;
   } catch (err) {
     log('error', `Failed to extract session data: ${err.message}`);
