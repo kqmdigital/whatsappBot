@@ -9,7 +9,7 @@ const { createClient } = require('@supabase/supabase-js');
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '1.0.1';
+const BOT_VERSION = '1.0.2';
 const startedAt = Date.now();
 
 // Multiple webhook URLs support
@@ -46,10 +46,11 @@ const HUMAN_BEHAVIOR = {
   OFFLINE_DURATION_MAX: 600000, // 10 minutes
 };
 
-// Rate limiting storage
+// Rate limiting storage with proper initialization
 const rateLimiter = {
   messageTimestamps: [],
   lastMessageTime: 0,
+  isInitialized: true
 };
 
 console.log('🔍 Loaded Webhook URLs:');
@@ -143,9 +144,13 @@ function splitMessageIntoChunks(message, maxLength = HUMAN_BEHAVIOR.MAX_MESSAGE_
 }
 
 /**
- * Check rate limits
+ * Check rate limits - Fixed logic
  */
 function checkRateLimit() {
+  if (!rateLimiter.isInitialized) {
+    return { allowed: true };
+  }
+
   const now = Date.now();
   const oneMinuteAgo = now - 60000;
   const oneHourAgo = now - 3600000;
@@ -170,10 +175,12 @@ function checkRateLimit() {
   }
   
   // Check minimum delay between messages
-  const timeSinceLastMessage = now - rateLimiter.lastMessageTime;
-  if (timeSinceLastMessage < HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES) {
-    const waitTime = HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES - timeSinceLastMessage;
-    return { allowed: false, reason: 'Rate limit: too fast', waitTime };
+  if (rateLimiter.lastMessageTime > 0) {
+    const timeSinceLastMessage = now - rateLimiter.lastMessageTime;
+    if (timeSinceLastMessage < HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES) {
+      const waitTime = HUMAN_BEHAVIOR.MIN_DELAY_BETWEEN_MESSAGES - timeSinceLastMessage;
+      return { allowed: false, reason: 'Rate limit: too fast', waitTime };
+    }
   }
   
   return { allowed: true };
@@ -343,7 +350,7 @@ function simulatePresence(client) {
   }, randomInterval);
 }
 
-// --- Enhanced Session Data Extraction (Modified as per suggestion) ---
+// --- Enhanced Session Data Extraction (Fixed) ---
 async function extractSessionData(client) {
   if (!client || !client.pupPage) {
     log('warn', '⚠️ Cannot extract session data: No puppeteer page available');
@@ -353,7 +360,10 @@ async function extractSessionData(client) {
   try {
     // Check if page is still usable
     try {
-      const isPageAlive = await client.pupPage.evaluate(() => true).catch(() => false);
+      const isPageAlive = await Promise.race([
+        client.pupPage.evaluate(() => true),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Page evaluation timeout')), 5000))
+      ]);
       if (!isPageAlive) {
         log('warn', '⚠️ Puppeteer page is no longer responsive, cannot extract data');
         return null;
@@ -363,40 +373,54 @@ async function extractSessionData(client) {
       return null;
     }
 
-    // Enhanced localStorage extraction
-    const rawLocalStorage = await client.pupPage.evaluate(() => {
-      try {
-        // First, verify WAWebJS has properly loaded
-        if (typeof window.Store === 'undefined' || !window.Store) {
-          console.error("WhatsApp Web Store not initialized");
-          return { error: "Store not initialized" };
-        }
+    // Enhanced localStorage extraction with timeout
+    const rawLocalStorage = await Promise.race([
+      client.pupPage.evaluate(() => {
+        try {
+          // First, verify WAWebJS has properly loaded
+          if (typeof window.Store === 'undefined' || !window.Store) {
+            console.error("WhatsApp Web Store not initialized");
+            return { error: "Store not initialized" };
+          }
 
-        // Extract ALL localStorage data comprehensively
-        const data = {};
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          data[key] = localStorage.getItem(key);
-        }
+          // Extract ALL localStorage data comprehensively
+          const data = {};
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key) {
+              try {
+                data[key] = localStorage.getItem(key);
+              } catch (itemErr) {
+                console.warn(`Failed to get localStorage item ${key}:`, itemErr);
+              }
+            }
+          }
 
-        // Add additional WAWebJS-specific session data if available
-        if (window.Store && window.Store.AppState) {
-          data['WAWebJS_AppState'] = JSON.stringify(window.Store.AppState.serialize());
-        }
-        
-        // Add session metadata (from original index (8).js)
-        data['_session_metadata'] = JSON.stringify({
-          timestamp: Date.now(),
-          userAgent: navigator.userAgent,
-          url: window.location.href
-        });
+          // Add additional WAWebJS-specific session data if available
+          if (window.Store && window.Store.AppState) {
+            try {
+              data['WAWebJS_AppState'] = JSON.stringify(window.Store.AppState.serialize());
+            } catch (appStateErr) {
+              console.warn('Failed to serialize AppState:', appStateErr);
+            }
+          }
+          
+          // Add session metadata
+          data['_session_metadata'] = JSON.stringify({
+            timestamp: Date.now(),
+            userAgent: navigator.userAgent,
+            url: window.location.href,
+            extractedKeys: Object.keys(data).length
+          });
 
-        return data;
-      } catch (e) {
-        console.error("Error extracting localStorage:", e);
-        return { error: e.toString() };
-      }
-    }).catch(err => {
+          return data;
+        } catch (e) {
+          console.error("Error extracting localStorage:", e);
+          return { error: e.toString() };
+        }
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Extraction timeout')), 10000))
+    ]).catch(err => {
       log('warn', `⚠️ Error during page evaluation: ${err.message}`);
       return { error: err.message };
     });
@@ -406,22 +430,39 @@ async function extractSessionData(client) {
       return null;
     }
 
-    // Check if enough items were extracted
-    if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) { // Min items check
-      log('info', `🔍 Extracted raw localStorage with ${Object.keys(rawLocalStorage).length} items`);
-
-      // Validate session size (common check in both files)
+    // Enhanced validation
+    if (rawLocalStorage && typeof rawLocalStorage === 'object') {
+      const keys = Object.keys(rawLocalStorage);
       const sessionSize = JSON.stringify(rawLocalStorage).length;
+      
+      log('info', `🔍 Extracted raw localStorage with ${keys.length} items`);
+
+      // Check for essential WhatsApp keys
+      const essentialKeys = ['WABrowserId', 'WASecretBundle', 'WAToken1', 'WAToken2'];
+      const hasEssentialKeys = keys.some(key => 
+        essentialKeys.some(essential => key.includes(essential))
+      );
+
+      // Size validation
       if (sessionSize < 5000) {
         log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
         return null;
       }
+
+      // Item count validation
+      if (keys.length < 10) {
+        log('warn', `Too few localStorage items found (${keys.length}), might be invalid`);
+        return null;
+      }
       
-      log('info', `✅ Valid session data extracted (${sessionSize} bytes)`);
-      return rawLocalStorage; // Now, if size is okay, it will return the data
+      if (!hasEssentialKeys) {
+        log('warn', `Session data missing some essential WhatsApp keys, but size (${sessionSize} bytes) and item count (${keys.length}) seem valid`);
+      }
       
+      log('info', `✅ Valid session data extracted (${sessionSize} bytes, ${keys.length} items)`);
+      return rawLocalStorage;
     } else {
-      log('warn', 'localStorage extraction found too few items');
+      log('warn', 'localStorage extraction found no valid data');
     }
 
     return null;
@@ -431,12 +472,13 @@ async function extractSessionData(client) {
   }
 }
 
-// --- Enhanced Supabase Store for WhatsApp Session ---
+// --- Enhanced Supabase Store for WhatsApp Session (Fixed) ---
 class SupabaseStore {
   constructor(supabaseClient, sessionId) {
     this.supabase = supabaseClient;
     this.sessionId = sessionId;
     this.client = null; // Will be set by RemoteAuth
+    this.isSaving = false; // Prevent concurrent saves
     log('info', `SupabaseStore initialized for session ID: ${this.sessionId}`);
   }
 
@@ -475,7 +517,9 @@ class SupabaseStore {
         .single();
 
       if (error) {
-        log('warn', `No existing session found for ${sessionKey}: ${error.message}`);
+        if (error.code !== 'PGRST116') { // Not found error
+          log('warn', `Error retrieving session for ${sessionKey}: ${error.message}`);
+        }
         return null;
       }
       
@@ -495,18 +539,21 @@ class SupabaseStore {
         }
       }
 
-      // Validate essential session keys
+      // Enhanced validation
       if (typeof sessionData === 'object' && sessionData !== null) {
-        const hasEssentialData = Object.keys(sessionData).some(key => 
+        const keys = Object.keys(sessionData);
+        const hasEssentialData = keys.some(key => 
           key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
         );
         
         if (!hasEssentialData) {
-          log('warn', `Session data exists (from Supabase) but missing essential WhatsApp keys for ${sessionKey}`);
+          log('warn', `Session data exists but missing essential WhatsApp keys for ${sessionKey}`);
         }
+
+        const dataSize = JSON.stringify(sessionData).length;
+        log('info', `✅ Session data extracted from Supabase for ${sessionKey} (${dataSize} bytes, ${keys.length} items)`);
       }
       
-      log('info', `✅ Valid session data extracted from Supabase for ${sessionKey}`);
       return sessionData;
     } catch (err) {
       log('error', `Exception in extract: ${err.message}`);
@@ -514,42 +561,67 @@ class SupabaseStore {
     }
   }
 
-  // Required by RemoteAuth interface
+  // Required by RemoteAuth interface (Fixed)
   async save({ session, sessionData }) {
     const sessionKey = session || this.sessionId;
     
+    // Prevent concurrent saves
+    if (this.isSaving) {
+      log('warn', `Save already in progress for ${sessionKey}, skipping duplicate request`);
+      return;
+    }
+
+    this.isSaving = true;
+    
     try {
-      // Validate sessionData before saving
+      // Enhanced validation
       if (!sessionData || typeof sessionData !== 'object') {
-        log('error', 'Invalid session data provided for saving');
+        log('error', 'Invalid session data provided for saving - not an object or null');
         return;
       }
 
+      const keys = Object.keys(sessionData);
       const dataSize = JSON.stringify(sessionData).length;
-      log('info', `Saving session data (${dataSize} bytes) for ${sessionKey}`);
+      
+      // Size validation
+      if (dataSize < 1000) {
+        log('error', `Session data too small for saving (${dataSize} bytes), aborting save`);
+        return;
+      }
 
-      // Ensure we have essential WhatsApp data
-      const hasEssentialData = Object.keys(sessionData).some(key => 
+      // Item count validation
+      if (keys.length < 5) {
+        log('error', `Session data has too few items for saving (${keys.length} items), aborting save`);
+        return;
+      }
+
+      log('info', `Saving session data (${dataSize} bytes, ${keys.length} items) for ${sessionKey}`);
+
+      // Check for essential WhatsApp data
+      const hasEssentialData = keys.some(key => 
         key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
       );
       
       if (!hasEssentialData) {
-        log('warn', 'Session data (for saving) missing essential WhatsApp keys, attempting to extract fresh data');
+        log('warn', 'Session data missing essential WhatsApp keys, attempting to extract fresh data');
         
         if (this.client) {
           const freshData = await extractSessionData(this.client);
           if (freshData) {
-            sessionData = freshData;
-            log('info', 'Using fresh extracted session data for save');
-            const freshHasEssential = Object.keys(sessionData).some(key => 
-                key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
+            const freshKeys = Object.keys(freshData);
+            const freshSize = JSON.stringify(freshData).length;
+            const freshHasEssential = freshKeys.some(key => 
+              key.includes('WABrowserId') || key.includes('WASecretBundle') || key.includes('WAToken')
             );
-            if (!freshHasEssential) {
-                log('warn', 'Freshly extracted session data also missing essential keys. Saving as is based on size/item count.');
+            
+            if (freshHasEssential && freshSize > dataSize) {
+              sessionData = freshData;
+              log('info', `Using fresh extracted session data for save (${freshSize} bytes, ${freshKeys.length} items)`);
+            } else if (!freshHasEssential) {
+              log('warn', 'Freshly extracted session data also missing essential keys. Saving original data based on size/item count.');
             }
           } else {
-            log('warn', 'Fresh extraction for save attempt also yielded no valid data. Aborting save.');
-            return;
+            log('warn', 'Fresh extraction yielded no valid data. Proceeding with original data.');
           }
         }
       }
@@ -572,6 +644,8 @@ class SupabaseStore {
       }
     } catch (err) {
       log('error', `Exception in save: ${err.message}`);
+    } finally {
+      this.isSaving = false;
     }
   }
 
@@ -615,6 +689,42 @@ class SupabaseStore {
     } catch (err) {
       log('warn', `Exception creating backup: ${err.message}`);
     }
+  }
+
+  // Enhanced session validation (Fixed)
+  async validateSession(sessionData) {
+    if (!sessionData || typeof sessionData !== 'object') {
+      log('warn', 'SupabaseStore.validateSession: Session data is null or not an object.');
+      return false;
+    }
+
+    const keys = Object.keys(sessionData);
+    const dataSize = JSON.stringify(sessionData).length;
+
+    // Size validation
+    if (dataSize < 1000) {
+      log('warn', `SupabaseStore.validateSession: Session data too small: ${dataSize} bytes. Validation failed.`);
+      return false;
+    }
+
+    // Item count validation  
+    if (keys.length < 5) {
+      log('warn', `SupabaseStore.validateSession: Too few session items: ${keys.length}. Validation failed.`);
+      return false;
+    }
+
+    // Check for essential keys
+    const requiredKeys = ['WABrowserId', 'WASecretBundle', 'WAToken1', 'WAToken2'];
+    const hasRequiredKeys = keys.some(dataKey => 
+      requiredKeys.some(reqKey => dataKey.includes(reqKey))
+    );
+
+    if (!hasRequiredKeys) {
+      log('warn', 'SupabaseStore.validateSession: Session data appears to be missing some commonly expected WhatsApp keys. Proceeding with size check.');
+    }
+
+    log('info', `SupabaseStore.validateSession: Session data passed validation (Size: ${dataSize} bytes, Items: ${keys.length}${hasRequiredKeys ? ", essential keys found" : ", essential keys not confirmed but size/count sufficient"}).`);
+    return true; 
   }
 
   // Method to extract and backup local session to Supabase
@@ -668,103 +778,84 @@ class SupabaseStore {
       return null;
     }
   }
-
-  // Enhanced session validation
-  async validateSession(sessionData) {
-    if (!sessionData || typeof sessionData !== 'object') {
-      log('warn', 'SupabaseStore.validateSession: Session data is null or not an object.');
-      return false;
-    }
-
-    const requiredKeys = ['WABrowserId', 'WASecretBundle', 'WAToken1', 'WAToken2'];
-    const hasRequiredKeys = Object.keys(sessionData).some(dataKey => 
-        requiredKeys.some(reqKey => dataKey.includes(reqKey))
-    );
-
-    if (!hasRequiredKeys) {
-      log('warn', 'SupabaseStore.validateSession: Session data appears to be missing some commonly expected WhatsApp keys. Proceeding with size check.');
-    }
-
-    const dataSize = JSON.stringify(sessionData).length;
-    if (dataSize < 5000) {
-      log('warn', `SupabaseStore.validateSession: Session data too small: ${dataSize} bytes. Validation failed.`);
-      return false;
-    }
-
-    log('info', `SupabaseStore.validateSession: Session data passed validation (Size: ${dataSize} bytes${hasRequiredKeys ? ", essential keys found" : ", specific essential keys not all confirmed but size is sufficient"}).`);
-    return true; 
-  }
 }
 
-// Enhanced session save function
+// Enhanced session save function (Fixed)
 async function safelyTriggerSessionSave(client) {
-  if (!client) return false;
+  if (!client) {
+    log('warn', 'Cannot trigger session save: client is null');
+    return false;
+  }
   
   try {
     const sessionData = await extractSessionData(client);
     
-    if (sessionData) {
-      const sessionSize = JSON.stringify(sessionData).length;
-      log('info', `📥 Got session data to save (${sessionSize} bytes) from extractSessionData`);
-      
-      const storeFromAuth = client.authStrategy?.store;
-      if (storeFromAuth && typeof storeFromAuth.validateSession === 'function') {
-        const isValid = await storeFromAuth.validateSession(sessionData);
-        if (!isValid) {
-          log('warn', 'Session data validation failed by SupabaseStore.validateSession in safelyTriggerSessionSave');
-          return false; 
-        }
-      } else {
-        log('warn', 'SupabaseStore or validateSession method not found via client.authStrategy.store, falling back to basic size check.');
-        if (sessionSize < 5000) {
-            log('warn', `Fallback size check: Session data too small (${sessionSize} bytes), might be invalid`);
-            return false;
-        }
-      }
-      
-      if (storeFromAuth && typeof storeFromAuth.save === 'function') {
-        if (storeFromAuth.client !== client) {
-            log('info', 'Setting client reference in storeFromAuth for saving.');
-            storeFromAuth.client = client;
-        }
-        await storeFromAuth.save({ session: SESSION_ID, sessionData: sessionData });
-        log('info', '📥 Session save triggered directly on SupabaseStore (from authStrategy) with valid data');
-      } else if (supabaseStore && typeof supabaseStore.save === 'function') {
-        log('warn', 'client.authStrategy.store.save not found or invalid, attempting to use global supabaseStore.save()');
-        if (supabaseStore.client !== client) {
-            log('info', 'Setting client reference in global supabaseStore for saving.');
-            supabaseStore.client = client;
-        }
-        await supabaseStore.save({ session: SESSION_ID, sessionData: sessionData });
-        log('info', '📥 Session save triggered on global supabaseStore instance');
-      } else {
-        log('error', 'CRITICAL: No save method available on any SupabaseStore instance.');
-        return false;
-      }
-
-      // Extra: Create a backup copy of session data directly to file system
-      try {
-        const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-        if (!fs.existsSync(sessionDir)) {
-          fs.mkdirSync(sessionDir, { recursive: true });
-        }
-        const backupFile = path.join(sessionDir, 'session_backup.json');
-        await fs.promises.writeFile(
-          backupFile,
-          JSON.stringify(sessionData, null, 2),
-          { encoding: 'utf8' }
-        );
-        log('info', '📥 Created additional filesystem backup of session');
-      } catch (backupErr) {
-        log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
-      }
-      return true;
-    } else {
-      log('warn', '❓ Could not find valid session data from extractSessionData for saving (returned null).');
+    if (!sessionData) {
+      log('warn', '❓ Could not extract valid session data for saving (returned null).');
       return false;
     }
+
+    const sessionSize = JSON.stringify(sessionData).length;
+    const sessionKeys = Object.keys(sessionData).length;
+    log('info', `📥 Got session data to save (${sessionSize} bytes, ${sessionKeys} items) from extractSessionData`);
+    
+    // Validate using store if available
+    const storeFromAuth = client.authStrategy?.store;
+    if (storeFromAuth && typeof storeFromAuth.validateSession === 'function') {
+      const isValid = await storeFromAuth.validateSession(sessionData);
+      if (!isValid) {
+        log('warn', 'Session data validation failed by SupabaseStore.validateSession in safelyTriggerSessionSave');
+        return false; 
+      }
+    } else {
+      log('warn', 'SupabaseStore or validateSession method not found via client.authStrategy.store, using fallback validation.');
+      if (sessionSize < 1000 || sessionKeys < 5) {
+        log('warn', `Fallback validation failed: Session data too small (${sessionSize} bytes) or too few items (${sessionKeys})`);
+        return false;
+      }
+    }
+    
+    // Save using the appropriate store
+    if (storeFromAuth && typeof storeFromAuth.save === 'function') {
+      if (storeFromAuth.client !== client) {
+        log('info', 'Setting client reference in storeFromAuth for saving.');
+        storeFromAuth.client = client;
+      }
+      await storeFromAuth.save({ session: SESSION_ID, sessionData: sessionData });
+      log('info', '📥 Session save triggered directly on SupabaseStore (from authStrategy) with valid data');
+    } else if (supabaseStore && typeof supabaseStore.save === 'function') {
+      log('warn', 'client.authStrategy.store.save not found or invalid, attempting to use global supabaseStore.save()');
+      if (supabaseStore.client !== client) {
+        log('info', 'Setting client reference in global supabaseStore for saving.');
+        supabaseStore.client = client;
+      }
+      await supabaseStore.save({ session: SESSION_ID, sessionData: sessionData });
+      log('info', '📥 Session save triggered on global supabaseStore instance');
+    } else {
+      log('error', 'CRITICAL: No save method available on any SupabaseStore instance.');
+      return false;
+    }
+
+    // Create filesystem backup
+    try {
+      const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+      if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true });
+      }
+      const backupFile = path.join(sessionDir, 'session_backup.json');
+      await fs.promises.writeFile(
+        backupFile,
+        JSON.stringify(sessionData, null, 2),
+        { encoding: 'utf8' }
+      );
+      log('info', '📥 Created additional filesystem backup of session');
+    } catch (backupErr) {
+      log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
+    }
+    
+    return true;
   } catch (err) {
-    log('error', `Failed to request session save: ${err.message} ${err.stack}`);
+    log('error', `Failed to request session save: ${err.message}`);
     return false;
   }
 }
@@ -840,27 +931,27 @@ function setupClientEvents(c) {
       simulatePresence(c);
     }, getRandomDelay(5000, 15000)); // Random delay before starting presence simulation
     
-    // Trigger session save after client is ready
+    // Trigger session save after client is ready (with delay to ensure stability)
     setTimeout(async () => {
       try {
         await safelyTriggerSessionSave(c);
       } catch (err) {
         log('warn', `Failed to save session after ready: ${err.message}`);
       }
-    }, 5000);
+    }, 10000); // Increased delay
   });
 
   c.on('authenticated', async () => {
     log('info', '🔐 Client authenticated.');
     
-    // Trigger session save after authentication
+    // Trigger session save after authentication (with delay)
     setTimeout(async () => {
       try {
         await safelyTriggerSessionSave(c);
       } catch (err) {
         log('warn', `Failed to save session after auth: ${err.message}`);
       }
-    }, 2000);
+    }, 5000); // Increased delay
   });
 
   c.on('remote_session_saved', () => {
