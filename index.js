@@ -634,12 +634,11 @@ async function handleIncomingMessage(msg) {
 
   // Check for different trigger conditions
   const isValuationMessage = 
-    text.toLowerCase().includes('valuation') ||
-    (hasReply && replyInfo?.text?.toLowerCase().includes('valuation'));
+    text.toLowerCase().includes('valuation request') ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('valuation request'));
 
   const isInterestRateMessage = 
-    text.toLowerCase().includes('dear valued partners') ||
-    text.toLowerCase().includes('interest rate');
+    text.toLowerCase().includes('keyquest mortgage team')
 
   // Skip if message doesn't match any trigger conditions
   if (!isValuationMessage && !isInterestRateMessage) {
@@ -649,10 +648,10 @@ async function handleIncomingMessage(msg) {
 
   // Log what triggered the message processing
   if (isValuationMessage) {
-    if (text.toLowerCase().includes('valuation')) {
+    if (text.toLowerCase().includes('valuation request')) {
       log('info', '📊 Valuation message detected (direct mention)');
-    } else if (hasReply && replyInfo?.text?.toLowerCase().includes('valuation')) {
-      log('info', '📊 Valuation message detected (reply to valuation message)');
+    } else if (hasReply && replyInfo?.text?.toLowerCase().includes('valuation request')) {
+      log('info', '📊 Valuation message detected (reply to valuation request)');
     }
   }
   
