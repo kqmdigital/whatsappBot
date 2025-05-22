@@ -20,6 +20,320 @@ const VALUATION_WEBHOOK_URL = process.env.VALUATION_WEBHOOK_URL;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
+// --- Human-like Behavior Configuration ---
+const HUMAN_CONFIG = {
+  // Random delays (in milliseconds)
+  MIN_READ_DELAY: 2000,        // Minimum time before "reading" a message
+  MAX_READ_DELAY: 15000,       // Maximum time before "reading" a message
+  MIN_RESPONSE_DELAY: 3000,    // Minimum time before processing/responding
+  MAX_RESPONSE_DELAY: 30000,   // Maximum time before processing/responding
+  MIN_TYPING_DURATION: 1000,   // Minimum typing indicator duration
+  MAX_TYPING_DURATION: 5000,   // Maximum typing indicator duration
+  
+  // Rate limiting
+  MAX_MESSAGES_PER_HOUR: 50,   // Maximum messages to process per hour
+  MAX_MESSAGES_PER_DAY: 300,   // Maximum messages to process per day
+  COOLDOWN_BETWEEN_ACTIONS: 1000, // Minimum time between any actions
+  
+  // Activity patterns (24-hour format)
+  ACTIVE_HOURS_START: 7,       // Start being active at 7 AM
+  ACTIVE_HOURS_END: 23,        // Stop being active at 11 PM
+  SLEEP_MODE_DELAY_MULTIPLIER: 5, // Multiply delays during sleep hours
+  
+  // Session behavior
+  SESSION_BREAK_INTERVAL: 2 * 60 * 60 * 1000, // Take a break every 2 hours
+  SESSION_BREAK_DURATION: 15 * 60 * 1000,     // Break for 15 minutes
+  
+  // Message patterns
+  IGNORE_PROBABILITY: 0.05,    // 5% chance to ignore a message (simulate human oversight)
+  DOUBLE_CHECK_PROBABILITY: 0.1, // 10% chance to re-read a message
+};
+
+// --- Human Behavior Tracking ---
+class HumanBehaviorManager {
+  constructor() {
+    this.messageCount = { hourly: 0, daily: 0 };
+    this.lastAction = 0;
+    this.lastHourReset = Date.now();
+    this.lastDayReset = Date.now();
+    this.isOnBreak = false;
+    this.breakStartTime = 0;
+    this.lastBreakTime = Date.now();
+    this.processedMessages = new Set(); // Track processed message IDs
+    this.messageQueue = []; // Queue for processing messages
+    this.isProcessingQueue = false;
+  }
+
+  // Check if we're in active hours
+  isActiveHours() {
+    const now = new Date();
+    const hour = now.getHours();
+    return hour >= HUMAN_CONFIG.ACTIVE_HOURS_START && hour < HUMAN_CONFIG.ACTIVE_HOURS_END;
+  }
+
+  // Check if we should take a break
+  shouldTakeBreak() {
+    const timeSinceLastBreak = Date.now() - this.lastBreakTime;
+    return timeSinceLastBreak > HUMAN_CONFIG.SESSION_BREAK_INTERVAL && this.isActiveHours();
+  }
+
+  // Start a session break
+  async startBreak() {
+    if (this.isOnBreak) return;
+    
+    this.isOnBreak = true;
+    this.breakStartTime = Date.now();
+    log('info', '😴 Starting human-like session break...');
+    
+    setTimeout(() => {
+      this.endBreak();
+    }, HUMAN_CONFIG.SESSION_BREAK_DURATION);
+  }
+
+  // End a session break
+  endBreak() {
+    this.isOnBreak = false;
+    this.lastBreakTime = Date.now();
+    log('info', '😊 Session break ended, resuming activity...');
+  }
+
+  // Check if we can process more messages (rate limiting)
+  canProcessMessage() {
+    this.resetCountersIfNeeded();
+    
+    if (this.isOnBreak) {
+      log('info', '😴 Currently on break, skipping message processing');
+      return false;
+    }
+
+    if (this.messageCount.hourly >= HUMAN_CONFIG.MAX_MESSAGES_PER_HOUR) {
+      log('warn', '⏱️ Hourly message limit reached, skipping message');
+      return false;
+    }
+
+    if (this.messageCount.daily >= HUMAN_CONFIG.MAX_MESSAGES_PER_DAY) {
+      log('warn', '📅 Daily message limit reached, skipping message');
+      return false;
+    }
+
+    // Check cooldown between actions
+    const timeSinceLastAction = Date.now() - this.lastAction;
+    if (timeSinceLastAction < HUMAN_CONFIG.COOLDOWN_BETWEEN_ACTIONS) {
+      return false;
+    }
+
+    return true;
+  }
+
+  // Reset counters when needed
+  resetCountersIfNeeded() {
+    const now = Date.now();
+    
+    // Reset hourly counter
+    if (now - this.lastHourReset > 60 * 60 * 1000) {
+      this.messageCount.hourly = 0;
+      this.lastHourReset = now;
+      log('debug', '🔄 Hourly message counter reset');
+    }
+
+    // Reset daily counter
+    if (now - this.lastDayReset > 24 * 60 * 60 * 1000) {
+      this.messageCount.daily = 0;
+      this.lastDayReset = now;
+      log('debug', '🔄 Daily message counter reset');
+    }
+  }
+
+  // Record message processing
+  recordMessageProcessed(messageId) {
+    this.messageCount.hourly++;
+    this.messageCount.daily++;
+    this.lastAction = Date.now();
+    this.processedMessages.add(messageId);
+    
+    // Clean old processed messages (keep only last 1000)
+    if (this.processedMessages.size > 1000) {
+      const messagesToRemove = Array.from(this.processedMessages).slice(0, 100);
+      messagesToRemove.forEach(id => this.processedMessages.delete(id));
+    }
+  }
+
+  // Check if message was already processed
+  wasMessageProcessed(messageId) {
+    return this.processedMessages.has(messageId);
+  }
+
+  // Generate human-like delay
+  getRandomDelay(min, max) {
+    const baseDelay = Math.random() * (max - min) + min;
+    
+    // Apply sleep mode multiplier if outside active hours
+    if (!this.isActiveHours()) {
+      return baseDelay * HUMAN_CONFIG.SLEEP_MODE_DELAY_MULTIPLIER;
+    }
+    
+    return baseDelay;
+  }
+
+  // Add message to processing queue
+  addToQueue(messageData) {
+    this.messageQueue.push({
+      ...messageData,
+      addedAt: Date.now(),
+      processAt: Date.now() + this.getRandomDelay(HUMAN_CONFIG.MIN_READ_DELAY, HUMAN_CONFIG.MAX_READ_DELAY)
+    });
+
+    if (!this.isProcessingQueue) {
+      this.processQueue();
+    }
+  }
+
+  // Process message queue with human-like timing
+  async processQueue() {
+    if (this.isProcessingQueue) return;
+    this.isProcessingQueue = true;
+
+    while (this.messageQueue.length > 0) {
+      const now = Date.now();
+      const nextMessage = this.messageQueue.find(msg => msg.processAt <= now);
+
+      if (!nextMessage) {
+        // Wait for the next message to be ready
+        const nextProcessTime = Math.min(...this.messageQueue.map(msg => msg.processAt));
+        const waitTime = Math.min(nextProcessTime - now, 5000); // Wait max 5 seconds
+        await this.sleep(waitTime);
+        continue;
+      }
+
+      // Remove message from queue
+      const messageIndex = this.messageQueue.indexOf(nextMessage);
+      this.messageQueue.splice(messageIndex, 1);
+
+      // Process the message
+      try {
+        await this.processMessageWithHumanBehavior(nextMessage);
+      } catch (err) {
+        log('error', `Error processing queued message: ${err.message}`);
+      }
+
+      // Random delay between processing messages
+      const delay = this.getRandomDelay(1000, 5000);
+      await this.sleep(delay);
+    }
+
+    this.isProcessingQueue = false;
+  }
+
+  // Process message with human-like behavior
+  async processMessageWithHumanBehavior(messageData) {
+    const { msg, payload } = messageData;
+
+    // Check if we should take a break
+    if (this.shouldTakeBreak()) {
+      await this.startBreak();
+      return;
+    }
+
+    // Random chance to ignore message (simulate human oversight)
+    if (Math.random() < HUMAN_CONFIG.IGNORE_PROBABILITY) {
+      log('info', '🤷 Randomly ignoring message (simulating human oversight)');
+      return;
+    }
+
+    // Check rate limits
+    if (!this.canProcessMessage()) {
+      log('info', '⏱️ Rate limit reached, skipping message processing');
+      return;
+    }
+
+    // Simulate reading the message
+    await this.simulateReadingMessage(msg);
+
+    // Random chance to double-check message
+    if (Math.random() < HUMAN_CONFIG.DOUBLE_CHECK_PROBABILITY) {
+      log('info', '🔍 Double-checking message (simulating human behavior)');
+      await this.sleep(this.getRandomDelay(1000, 3000));
+    }
+
+    // Add response delay
+    const responseDelay = this.getRandomDelay(
+      HUMAN_CONFIG.MIN_RESPONSE_DELAY, 
+      HUMAN_CONFIG.MAX_RESPONSE_DELAY
+    );
+    await this.sleep(responseDelay);
+
+    // Process the message
+    await this.sendWebhooks(payload);
+    this.recordMessageProcessed(payload.messageId);
+  }
+
+  // Simulate reading a message (mark as read after delay)
+  async simulateReadingMessage(msg) {
+    try {
+      // Random delay before marking as read
+      const readDelay = this.getRandomDelay(HUMAN_CONFIG.MIN_READ_DELAY, HUMAN_CONFIG.MAX_READ_DELAY);
+      await this.sleep(readDelay);
+      
+      // Mark message as read (if supported)
+      if (msg && typeof msg.markAsRead === 'function') {
+        await msg.markAsRead();
+        log('debug', '👁️ Message marked as read');
+      }
+    } catch (err) {
+      log('warn', `Failed to mark message as read: ${err.message}`);
+    }
+  }
+
+  // Send webhooks with human-like timing
+  async sendWebhooks(payload) {
+    const webhooks = [];
+    
+    if (payload.messageType === 'valuation' && VALUATION_WEBHOOK_URL) {
+      webhooks.push({ url: VALUATION_WEBHOOK_URL, type: 'valuation' });
+    }
+    
+    if (payload.messageType === 'interest_rate' && INTEREST_RATE_WEBHOOK_URL) {
+      webhooks.push({ url: INTEREST_RATE_WEBHOOK_URL, type: 'interest_rate' });
+    }
+
+    if (N8N_WEBHOOK_URL) {
+      webhooks.push({ url: N8N_WEBHOOK_URL, type: 'main' });
+    }
+
+    // Send webhooks with delays between them
+    for (let i = 0; i < webhooks.length; i++) {
+      const webhook = webhooks[i];
+      await sendToWebhook(webhook.url, payload, webhook.type);
+      
+      // Add delay between webhook calls (except for the last one)
+      if (i < webhooks.length - 1) {
+        const delay = this.getRandomDelay(500, 2000);
+        await this.sleep(delay);
+      }
+    }
+  }
+
+  // Sleep utility
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Get status for health endpoint
+  getStatus() {
+    return {
+      isOnBreak: this.isOnBreak,
+      messageCount: this.messageCount,
+      queueLength: this.messageQueue.length,
+      isProcessingQueue: this.isProcessingQueue,
+      isActiveHours: this.isActiveHours(),
+      lastAction: new Date(this.lastAction).toISOString(),
+    };
+  }
+}
+
+// Initialize human behavior manager
+const humanBehavior = new HumanBehaviorManager();
+
 console.log('🔍 Loaded Webhook URLs:');
 console.log('- N8N_WEBHOOK_URL:', N8N_WEBHOOK_URL);
 console.log('- INTEREST_RATE_WEBHOOK_URL:', INTEREST_RATE_WEBHOOK_URL);
@@ -514,33 +828,34 @@ function setupClientEvents(c) {
   c.on('qr', qr => {
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}`;
     log('warn', `📱 Scan QR Code: ${qrUrl}`);
-    qrcode.generate(qr, { small: true });
   });
 
   c.on('ready', async () => {
     log('info', '✅ WhatsApp client is ready.');
     
-    // Trigger session save after client is ready
+    // Trigger session save after client is ready with human-like delay
+    const delay = humanBehavior.getRandomDelay(3000, 8000);
     setTimeout(async () => {
       try {
         await safelyTriggerSessionSave(c);
       } catch (err) {
         log('warn', `Failed to save session after ready: ${err.message}`);
       }
-    }, 5000);
+    }, delay);
   });
 
   c.on('authenticated', async () => {
     log('info', '🔐 Client authenticated.');
     
-    // Trigger session save after authentication
+    // Trigger session save after authentication with human-like delay
+    const delay = humanBehavior.getRandomDelay(1000, 3000);
     setTimeout(async () => {
       try {
         await safelyTriggerSessionSave(c);
       } catch (err) {
         log('warn', `Failed to save session after auth: ${err.message}`);
       }
-    }, 2000);
+    }, delay);
   });
 
   c.on('remote_session_saved', () => {
@@ -561,10 +876,11 @@ function setupClientEvents(c) {
       client = null;
     }
     
-    // Exponential backoff for reconnection
+    // Exponential backoff for reconnection with human-like randomness
     const attemptReconnection = (attempt = 1) => {
-      const delay = Math.min(Math.pow(2, attempt) * 1000, 60000);
-      log('info', `Will attempt reconnection (#${attempt}) in ${delay/1000} seconds`);
+      const baseDelay = Math.min(Math.pow(2, attempt) * 1000, 60000);
+      const randomDelay = baseDelay + (Math.random() * 10000); // Add up to 10s randomness
+      log('info', `Will attempt reconnection (#${attempt}) in ${randomDelay/1000} seconds`);
       
       setTimeout(async () => {
         try {
@@ -581,7 +897,7 @@ function setupClientEvents(c) {
           log('error', `Error during reconnection attempt #${attempt}: ${err.message}`);
           attemptReconnection(attempt + 1);
         }
-      }, delay);
+      }, randomDelay);
     };
     
     attemptReconnection();
@@ -593,7 +909,10 @@ function setupClientEvents(c) {
       await supabaseStore.delete({ session: SESSION_ID });
       log('info', 'Session deleted. Will attempt to reinitialize...');
       client = null;
-      setTimeout(startClient, 10000);
+      
+      // Add human-like delay before restart
+      const delay = humanBehavior.getRandomDelay(8000, 15000);
+      setTimeout(startClient, delay);
     } catch (err) {
       log('error', `Failed to clean up after auth failure: ${err.message}`);
       process.exit(1);
@@ -615,6 +934,12 @@ async function handleIncomingMessage(msg) {
   const senderId = msg.author || msg.from;
   const text = msg.body || '';
   const messageId = msg?.id?.id || msg?.id?._serialized || '';
+
+  // Skip if message was already processed
+  if (humanBehavior.wasMessageProcessed(messageId)) {
+    log('debug', '🔄 Message already processed, skipping');
+    return;
+  }
 
   let replyInfo = null;
   let hasReply = false;
@@ -683,19 +1008,9 @@ async function handleIncomingMessage(msg) {
     timestamp: new Date(msg.timestamp * 1000).toISOString(),
   };
 
-  // Send to appropriate webhook based on message type
-  if (isValuationMessage && VALUATION_WEBHOOK_URL) {
-    await sendToWebhook(VALUATION_WEBHOOK_URL, payload, 'valuation');
-  }
-  
-  if (isInterestRateMessage && INTEREST_RATE_WEBHOOK_URL) {
-    await sendToWebhook(INTEREST_RATE_WEBHOOK_URL, payload, 'interest_rate');
-  }
-
-  // Also send to main N8N webhook if configured
-  if (N8N_WEBHOOK_URL) {
-    await sendToWebhook(N8N_WEBHOOK_URL, payload, 'main');
-  }
+  // Add message to human behavior queue instead of processing immediately
+  humanBehavior.addToQueue({ msg, payload });
+  log('info', '📝 Message added to processing queue with human-like timing');
 }
 
 async function sendToWebhook(webhookUrl, payload, type = 'unknown', attempt = 0) {
@@ -721,16 +1036,20 @@ async function sendToWebhook(webhookUrl, payload, type = 'unknown', attempt = 0)
   }
 
   try {
-    await axios.post(webhookUrl, processedPayload, { timeout: 10000 });
+    // Add human-like delay before sending webhook
+    const delay = humanBehavior.getRandomDelay(500, 2000);
+    await humanBehavior.sleep(delay);
+
+    await axios.post(webhookUrl, processedPayload, { timeout: 15000 }); // Increased timeout
     log('info', `✅ ${type} webhook sent (${payloadSize} bytes).`);
   } catch (err) {
     log('error', `${type} webhook attempt ${attempt + 1} failed: ${err.message}`);
-    if (attempt < 4) {
-      const backoff = Math.min(Math.pow(2, attempt) * 1000, 15000);
+    if (attempt < 2) { // Reduced retry attempts to 3 total
+      const backoff = Math.min(Math.pow(2, attempt) * 1000, 10000) + (Math.random() * 2000);
       log('warn', `Will retry ${type} webhook in ${backoff/1000} seconds...`);
       setTimeout(() => sendToWebhook(webhookUrl, processedPayload, type, attempt + 1), backoff);
     } else {
-      log('error', `Giving up on ${type} webhook after 5 attempts`);
+      log('error', `Giving up on ${type} webhook after 3 attempts`);
     }
   }
 }
@@ -803,11 +1122,12 @@ app.get('/', (_, res) => {
     sessionId: SESSION_ID,
     version: BOT_VERSION,
     uptimeMinutes: Math.floor((Date.now() - startedAt) / 60000),
+    humanBehavior: humanBehavior.getStatus(),
     timestamp: new Date().toISOString(),
   });
 });
 
-// Enhanced send message endpoint supporting both individual and group chats
+// Enhanced send message endpoint with human behavior
 app.post('/send-message', async (req, res) => {
   const { jid, groupId, message, imageUrl } = req.body;
   
@@ -825,6 +1145,14 @@ app.post('/send-message', async (req, res) => {
     return res.status(503).json({ 
       success: false, 
       error: 'WhatsApp client not ready' 
+    });
+  }
+
+  // Check rate limits for sending messages
+  if (!humanBehavior.canProcessMessage()) {
+    return res.status(429).json({
+      success: false,
+      error: 'Rate limit exceeded or bot is on break'
     });
   }
 
@@ -847,6 +1175,28 @@ app.post('/send-message', async (req, res) => {
       } else {
         formattedId = targetId.endsWith('@c.us') ? targetId : `${targetId}@c.us`;
       }
+    }
+
+    // Add human-like delay before sending
+    const delay = humanBehavior.getRandomDelay(2000, 8000);
+    await humanBehavior.sleep(delay);
+
+    // Simulate typing (if supported)
+    try {
+      const chat = await client.getChatById(formattedId);
+      if (chat && typeof chat.sendStateTyping === 'function') {
+        await chat.sendStateTyping();
+        log('info', '⌨️ Typing indicator sent');
+        
+        // Random typing duration
+        const typingDuration = humanBehavior.getRandomDelay(
+          HUMAN_CONFIG.MIN_TYPING_DURATION, 
+          HUMAN_CONFIG.MAX_TYPING_DURATION
+        );
+        await humanBehavior.sleep(typingDuration);
+      }
+    } catch (typingErr) {
+      log('warn', `Failed to send typing indicator: ${typingErr.message}`);
     }
 
     let sentMessage;
@@ -874,6 +1224,9 @@ app.post('/send-message', async (req, res) => {
       sentMessage = await client.sendMessage(formattedId, message);
       log('info', `📝 Text message sent to ${formattedId}`);
     }
+
+    // Record the action
+    humanBehavior.recordMessageProcessed(`sent_${Date.now()}`);
 
     // Return original WhatsApp message ID format
     const messageId = sentMessage.id?.id || sentMessage.id?._serialized || sentMessage.id;
@@ -964,6 +1317,29 @@ app.post('/save-session', async (req, res) => {
   }
 });
 
+// Human behavior control endpoints
+app.post('/toggle-break', async (req, res) => {
+  try {
+    if (humanBehavior.isOnBreak) {
+      humanBehavior.endBreak();
+      res.status(200).json({ success: true, message: 'Break ended' });
+    } else {
+      await humanBehavior.startBreak();
+      res.status(200).json({ success: true, message: 'Break started' });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/human-status', (req, res) => {
+  res.status(200).json({
+    success: true,
+    status: humanBehavior.getStatus(),
+    config: HUMAN_CONFIG
+  });
+});
+
 // Health check endpoint
 app.get('/health', async (_, res) => {
   try {
@@ -991,6 +1367,7 @@ app.get('/health', async (_, res) => {
         ready: client ? true : false,
       },
       supabase: supabaseStatus,
+      humanBehavior: humanBehavior.getStatus(),
       system: {
         memory: {
           rss: `${(mem.rss / 1024 / 1024).toFixed(1)} MB`,
@@ -1026,15 +1403,20 @@ app.get('/ping', (_, res) => {
 const server = app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
   log('info', `🤖 Bot Version: ${BOT_VERSION}`);
-  log('info', '💻 Starting WhatsApp client in 3 seconds...');
-  setTimeout(startClient, 3000);
+  log('info', `🧠 Human behavior enabled with smart timing and rate limiting`);
+  log('info', '💻 Starting WhatsApp client in 5 seconds...');
+  
+  // Add random delay before starting client
+  const startDelay = humanBehavior.getRandomDelay(3000, 8000);
+  setTimeout(startClient, startDelay);
 });
 
-// Enhanced Watchdog - Monitor client health and save session periodically
+// Enhanced Watchdog with human behavior consideration
 setInterval(async () => {
   if (!client) {
     log('warn', '🕵️ Watchdog: client is missing. Restarting...');
-    await startClient();
+    const delay = humanBehavior.getRandomDelay(2000, 8000);
+    setTimeout(startClient, delay);
     return;
   }
 
@@ -1043,27 +1425,33 @@ setInterval(async () => {
     log('info', `✅ Watchdog: client state is "${state}".`);
 
     if (state === 'CONNECTED') {
-      // Periodically save session when connected
-      try {
-        await safelyTriggerSessionSave(client);
-        log('info', '💾 Periodic session save completed');
-      } catch (saveErr) {
-        log('warn', `Periodic session save failed: ${saveErr.message}`);
+      // Only save session periodically when not on break and during active hours
+      if (!humanBehavior.isOnBreak && humanBehavior.isActiveHours()) {
+        try {
+          await safelyTriggerSessionSave(client);
+          log('info', '💾 Periodic session save completed');
+        } catch (saveErr) {
+          log('warn', `Periodic session save failed: ${saveErr.message}`);
+        }
+      } else {
+        log('debug', '💤 Skipping session save (break time or inactive hours)');
       }
     } else {
       log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
       await client.destroy();
       client = null;
-      await startClient();
+      const delay = humanBehavior.getRandomDelay(5000, 15000);
+      setTimeout(startClient, delay);
     }
   } catch (err) {
     log('error', `🚨 Watchdog error during state check: ${err.message}. Restarting...`);
     client = null;
-    await startClient();
+    const delay = humanBehavior.getRandomDelay(5000, 15000);
+    setTimeout(startClient, delay);
   }
-}, 5 * 60 * 1000); // every 5 minutes
+}, 8 * 60 * 1000); // Increased interval to 8 minutes for more human-like behavior
 
-// Memory monitoring
+// Memory monitoring with human-aware timing
 const checkMemoryUsage = () => {
   const mem = process.memoryUsage();
   const rssMB = (mem.rss / 1024 / 1024).toFixed(1);
@@ -1087,7 +1475,10 @@ const checkMemoryUsage = () => {
           await client.destroy();
           client = null;
           log('warn', 'Client destroyed due to memory pressure');
-          setTimeout(startClient, 5000);
+          
+          // Add human-like delay before restart
+          const delay = humanBehavior.getRandomDelay(5000, 15000);
+          setTimeout(startClient, delay);
         } catch (err) {
           log('error', `Failed to restart client: ${err.message}`);
         }
@@ -1102,16 +1493,21 @@ const checkMemoryUsage = () => {
   }
 };
 
-setInterval(checkMemoryUsage, 5 * 60 * 1000);
+setInterval(checkMemoryUsage, 7 * 60 * 1000); // Slightly increased interval
 
-// Self-ping mechanism
+// Self-ping mechanism with human behavior
 let lastPingSent = 0;
 const selfPing = async () => {
   try {
     const now = Date.now();
-    if (now - lastPingSent > 4 * 60 * 1000) {
+    if (now - lastPingSent > 6 * 60 * 1000) { // Increased ping interval
       lastPingSent = now;
       const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
+      
+      // Add random delay before ping
+      const delay = humanBehavior.getRandomDelay(0, 2000);
+      await humanBehavior.sleep(delay);
+      
       await axios.get(`${appUrl}/ping`, { timeout: 5000 });
       log('debug', '🏓 Self-ping successful');
     }
@@ -1127,7 +1523,7 @@ app.use((req, res, next) => {
   next();
 });
 
-setInterval(selfPing, 4 * 60 * 1000);
+setInterval(selfPing, 6 * 60 * 1000); // Increased to 6 minutes
 
 // Helper function to format uptime
 function formatUptime(ms) {
