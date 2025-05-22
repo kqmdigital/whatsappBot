@@ -342,14 +342,25 @@ async function handleIncomingMessage(msg) {
 
   const isInterestRateMessage = 
     text.toLowerCase().includes('dear valued partners') ||
-    text.toLowerCase().includes('interest rate') ||
-    (hasReply && replyInfo?.text?.toLowerCase().includes('dear valued partners')) ||
-    (hasReply && replyInfo?.text?.toLowerCase().includes('interest rate'));
+    text.toLowerCase().includes('interest rate');
 
   // Skip if message doesn't match any trigger conditions
   if (!isValuationMessage && !isInterestRateMessage) {
     log('info', '🚫 Ignored message - no trigger keywords found.');
     return;
+  }
+
+  // Log what triggered the message processing
+  if (isValuationMessage) {
+    if (text.toLowerCase().includes('valuation')) {
+      log('info', '📊 Valuation message detected (direct mention)');
+    } else if (hasReply && replyInfo?.text?.toLowerCase().includes('valuation')) {
+      log('info', '📊 Valuation message detected (reply to valuation message)');
+    }
+  }
+  
+  if (isInterestRateMessage) {
+    log('info', '💰 Interest rate message detected (direct mention)');
   }
 
   // Memory logging every 50 messages
