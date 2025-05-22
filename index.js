@@ -31,8 +31,8 @@ const HUMAN_CONFIG = {
   MAX_TYPING_DURATION: 5000,   // Maximum typing indicator duration
   
   // Rate limiting
-  MAX_MESSAGES_PER_HOUR: 50,   // Maximum messages to process per hour
-  MAX_MESSAGES_PER_DAY: 300,   // Maximum messages to process per day
+  MAX_MESSAGES_PER_HOUR: 70,   // Maximum messages to process per hour
+  MAX_MESSAGES_PER_DAY: 420,   // Maximum messages to process per day
   COOLDOWN_BETWEEN_ACTIONS: 1000, // Minimum time between any actions
   
   // Activity patterns (24-hour format)
@@ -41,8 +41,8 @@ const HUMAN_CONFIG = {
   SLEEP_MODE_DELAY_MULTIPLIER: 5, // Multiply delays during sleep hours
   
   // Session behavior
-  SESSION_BREAK_INTERVAL: 2 * 60 * 60 * 1000, // Take a break every 2 hours
-  SESSION_BREAK_DURATION: 15 * 60 * 1000,     // Break for 15 minutes
+   SESSION_BREAK_INTERVAL: 365 * 24 * 60 * 60 * 1000, // 1 year
+   SESSION_BREAK_DURATION: 1000, // 1 second
   
   // Message patterns
   IGNORE_PROBABILITY: 0.05,    // 5% chance to ignore a message (simulate human oversight)
