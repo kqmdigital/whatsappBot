@@ -386,34 +386,33 @@ class SupabaseStore {
   }
 
   // Enhanced session validation
+ // Enhanced session validation
   async validateSession(sessionData) {
     if (!sessionData || typeof sessionData !== 'object') {
-      log('warn', 'ValidateSession: Session data is null or not an object.');
+      log('warn', 'SupabaseStore.validateSession: Session data is null or not an object.');
       return false;
     }
 
-    // This is the check that might still cause issues if the specific keys aren't found.
-    // If index (5).js worked without these specific keys being present (relying on size/AppState),
-    // then this validation might be too strict for compatibility.
     const requiredKeys = ['WABrowserId', 'WASecretBundle', 'WAToken1', 'WAToken2'];
-    const hasRequiredKeys = requiredKeys.some(key => 
-      Object.keys(sessionData).some(dataKey => dataKey.includes(key))
+    const hasRequiredKeys = Object.keys(sessionData).some(dataKey => 
+        requiredKeys.some(reqKey => dataKey.includes(reqKey))
     );
 
     if (!hasRequiredKeys) {
-      log('warn', 'SupabaseStore.validateSession: Session data missing required WhatsApp keys');
-      // return false; // To behave like index (5).js, you might consider removing this strict return false
-                       // if size and other factors are deemed sufficient by index (5).js's logic.
-                       // For now, leaving it as is, but this could be the next adjustment point.
+      log('warn', 'SupabaseStore.validateSession: Session data appears to be missing some commonly expected WhatsApp keys. Proceeding with size check.');
+      // We log the warning but don't return false immediately,
+      // to allow sessions that are large enough (like index (5).js might have saved)
+      // to pass this validation stage if that's the desired behavior.
     }
 
     const dataSize = JSON.stringify(sessionData).length;
     if (dataSize < 5000) {
-      log('warn', `SupabaseStore.validateSession: Session data too small: ${dataSize} bytes`);
+      log('warn', `SupabaseStore.validateSession: Session data too small: ${dataSize} bytes. Validation failed.`);
       return false;
     }
 
-    return true; // If it passes the size and (conditionally) the key check
+    log('info', `SupabaseStore.validateSession: Session data passed validation (Size: ${dataSize} bytes${hasRequiredKeys ? ", essential keys found" : ", specific essential keys not all confirmed but size is sufficient"}).`);
+    return true; 
   }
 }
 
@@ -422,92 +421,75 @@ async function safelyTriggerSessionSave(client) {
   if (!client) return false;
   
   try {
-    // Use direct localStorage extraction to get session data (uses modified extractSessionData)
+    // ... (extractSessionData call and initial checks remain the same) ...
     const sessionData = await extractSessionData(client);
     
     if (sessionData) {
       const sessionSize = JSON.stringify(sessionData).length;
       log('info', `📥 Got session data to save (${sessionSize} bytes) from extractSessionData`);
       
-      // Validate session data using SupabaseStore's method
-      const supabaseStore = client.authStrategy?.store;
-      if (supabaseStore && typeof supabaseStore.validateSession === 'function') {
-        const isValid = await supabaseStore.validateSession(sessionData); // This will use SupabaseStore's validation
+      const storeFromAuth = client.authStrategy?.store;
+      if (storeFromAuth && typeof storeFromAuth.validateSession === 'function') {
+        const isValid = await storeFromAuth.validateSession(sessionData); // Uses the updated validateSession
         if (!isValid) {
-          log('warn', 'Session data validation failed by SupabaseStore.validateSession');
-          return false;
+          log('warn', 'Session data validation failed by SupabaseStore.validateSession in safelyTriggerSessionSave');
+          return false; 
         }
       } else {
-        log('warn', 'SupabaseStore or validateSession method not found, skipping this validation step.');
-        // Fallback to basic size check if SupabaseStore.validateSession isn't available for some reason
+        log('warn', 'SupabaseStore or validateSession method not found via client.authStrategy.store, falling back to basic size check.');
         if (sessionSize < 5000) {
-            log('warn', `Fallback: Session data too small (${sessionSize} bytes), might be invalid`);
+            log('warn', `Fallback size check: Session data too small (${sessionSize} bytes), might be invalid`);
             return false;
         }
       }
       
-      // Save using auth strategy
-      if (client.authStrategy && typeof client.authStrategy.save === 'function') {
-        // Make sure client reference is set in store for RemoteAuth
-        if (client.authStrategy.store) {
-          client.authStrategy.store.client = client;
+      // --- THIS IS THE SAVE LOGIC BLOCK TO UPDATE ---
+      if (storeFromAuth && typeof storeFromAuth.save === 'function') {
+        // Ensure client reference is set in the store instance from authStrategy
+        if (storeFromAuth.client !== client) {
+            log('info', 'Setting client reference in storeFromAuth for saving.');
+            storeFromAuth.client = client;
         }
-        
-        // RemoteAuth's save expects an object like { sessionData: actualData }
-        // or just { session: sessionId, sessionData: actualData }
-        // The save method in SupabaseStore itself handles the sessionData directly.
-        // Let's ensure we're calling it correctly based on RemoteAuth's interface.
-        // RemoteAuth typically calls store.save({ session: this.clientId, sessionData }).
-        // If we are calling client.authStrategy.save(), it might be an internal method of RemoteAuth
-        // that eventually calls store.save().
-        // For clarity, we can directly call the store's save method if that's the intent.
-        // await supabaseStore.save({ session: SESSION_ID, sessionData: sessionData });
-
-        // The existing RemoteAuth setup should handle this if client.authStrategy.save() is called.
-        // Let's assume client.authStrategy.save will correctly propagate to supabaseStore.save.
-        // RemoteAuth save is usually triggered by events like 'remote_session_saved' or internally.
-        // For manual triggering, it's often better to call the store's method directly if we have it.
-        if (supabaseStore && typeof supabaseStore.save === 'function') {
-            await supabaseStore.save({ session: SESSION_ID, sessionData: sessionData });
-            log('info', '📥 Session save triggered directly on SupabaseStore with valid data');
-        } else if (client.authStrategy && typeof client.authStrategy.save === 'function') {
-            // This might be a RemoteAuth internal trigger, less direct
-            await client.authStrategy.save({ sessionData }); // Or it might need { session: SESSION_ID, sessionData }
-            log('info', '📥 Session save triggered via client.authStrategy.save()');
-        } else {
-            log('warn', 'No save method available on auth strategy or store.');
-            return false;
+        await storeFromAuth.save({ session: SESSION_ID, sessionData: sessionData });
+        log('info', '📥 Session save triggered directly on SupabaseStore (from authStrategy) with valid data');
+      } else if (supabaseStore && typeof supabaseStore.save === 'function') { // Fallback to global supabaseStore
+        log('warn', 'client.authStrategy.store.save not found or invalid, attempting to use global supabaseStore.save()');
+        // Ensure client reference is set in the global store instance
+        if (supabaseStore.client !== client) {
+            log('info', 'Setting client reference in global supabaseStore for saving.');
+            supabaseStore.client = client;
         }
-
-
-        // Extra: Create a backup copy of session data directly to file system
-        try {
-          const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
-          if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir, { recursive: true });
-          }
-          
-          const backupFile = path.join(sessionDir, 'session_backup.json');
-          await fs.promises.writeFile(
-            backupFile,
-            JSON.stringify(sessionData, null, 2),
-            { encoding: 'utf8' }
-          );
-          log('info', '📥 Created additional filesystem backup of session');
-        } catch (backupErr) {
-          log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
-        }
-        return true;
+        await supabaseStore.save({ session: SESSION_ID, sessionData: sessionData });
+        log('info', '📥 Session save triggered on global supabaseStore instance');
       } else {
-        log('warn', 'No save method available on auth strategy');
+        log('error', 'CRITICAL: No save method available on any SupabaseStore instance.'); // Changed to error
         return false;
       }
+      // --- END OF UPDATED SAVE LOGIC BLOCK ---
+
+      // Extra: Create a backup copy of session data directly to file system (this part is fine)
+      try {
+        const sessionDir = path.join(__dirname, `.wwebjs_auth/session-${SESSION_ID}`);
+        if (!fs.existsSync(sessionDir)) {
+          fs.mkdirSync(sessionDir, { recursive: true });
+        }
+        const backupFile = path.join(sessionDir, 'session_backup.json');
+        await fs.promises.writeFile(
+          backupFile,
+          JSON.stringify(sessionData, null, 2),
+          { encoding: 'utf8' }
+        );
+        log('info', '📥 Created additional filesystem backup of session');
+      } catch (backupErr) {
+        log('warn', `Failed to create filesystem backup: ${backupErr.message}`);
+      }
+      return true;
     } else {
-      log('warn', '❓ Could not find valid session data from extractSessionData for saving');
+      log('warn', '❓ Could not find valid session data from extractSessionData for saving (returned null).');
       return false;
     }
   } catch (err) {
-    log('error', `Failed to request session save: ${err.message}`);
+    log('error', `Failed to request session save: ${err.message} ${err.stack}`);
     return false;
   }
 }
