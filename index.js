@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { Client, RemoteAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 const axios = require('axios');
@@ -402,7 +402,289 @@ async function safelyTriggerSessionSave(client) {
       log('info', `📥 Got session data to save (${sessionSize} bytes)`);
       
       // Validate session data
-      const supabaseStore = client.authStrategy?.store;
+      class EnhancedLocalAuth extends LocalAuth {
+  constructor(options = {}) {
+    super(options);
+    this.supabase = options.supabase;
+    this.sessionId = options.sessionId || 'default';
+    this.retryCount = 0;
+    this.maxRetries = 3;
+    this.client = null; // Add client reference
+    log('info', `EnhancedLocalAuth initialized for session ID: ${this.sessionId}`);
+  }
+
+  async _executeWithRetry(operation, fallback = null) {
+    this.retryCount = 0;
+    while (this.retryCount < this.maxRetries) {
+      try {
+        return await operation();
+      } catch (err) {
+        this.retryCount++;
+        log('warn', `Supabase operation failed (attempt ${this.retryCount}/${this.maxRetries}): ${err.message}`);
+        if (this.retryCount >= this.maxRetries) {
+          log('error', `Max retries reached for Supabase operation: ${err.message}`);
+          return fallback;
+        }
+        // Exponential backoff
+        await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, this.retryCount)));
+      }
+    }
+  }
+
+  async afterInit(client) {
+    log('info', '🔄 afterInit called - starting session restoration process');
+    
+    try {
+      // Call parent afterInit but make sure it doesn't block our restoration
+      super.afterInit(client).catch(err => {
+        log('warn', `Parent afterInit error (continuing anyway): ${err.message}`);
+      });
+      
+      // Keep a reference to the client for session extraction
+      this.client = client;
+      
+      log('info', '🔍 Attempting to restore session from Supabase...');
+      
+      // Try to load session from Supabase first
+      const { data, error } = await this.supabase
+        .from('whatsapp_sessions')
+        .select('session_data')
+        .eq('session_key', this.sessionId)
+        .single();
+      
+      if (error) {
+        log('warn', `Failed to query session from Supabase: ${error.message}`);
+        return;
+      }
+      
+      if (data?.session_data) {
+        // Check if session data is valid
+        const sessionSize = JSON.stringify(data.session_data).length;
+        if (sessionSize < 5000) {
+          log('warn', `Session data too small (${sessionSize} bytes), might be invalid`);
+          return;
+        }
+        
+        log('info', `✅ Found valid session in Supabase (${sessionSize} bytes)`);
+        
+        // Save to local storage with retries
+        let retries = 0;
+        const maxRetries = 3;
+        
+        while (retries < maxRetries) {
+          try {
+            const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
+            if (!fs.existsSync(sessionDir)) {
+              fs.mkdirSync(sessionDir, { recursive: true });
+              log('info', `Created session directory: ${sessionDir}`);
+            }
+            
+            // Make sure to clear any existing session file first
+            const sessionFile = path.join(sessionDir, 'session.json');
+            if (fs.existsSync(sessionFile)) {
+              log('info', 'Removing existing session file before writing new one');
+              fs.unlinkSync(sessionFile);
+            }
+            
+            // Write the session data
+            await fs.promises.writeFile(
+              sessionFile,
+              JSON.stringify(data.session_data),
+              { encoding: 'utf8' }
+            );
+            
+            log('info', '✅ Session restored from Supabase to local storage');
+            
+            // Add a forced delay to ensure proper session loading
+            log('info', '⏳ Waiting 5 seconds for session to be properly applied...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            // Verify the file was written correctly
+            const savedContent = await fs.promises.readFile(
+              sessionFile,
+              { encoding: 'utf8' }
+            );
+            
+            if (savedContent && savedContent.length > 5000) {
+              log('info', '✓ Session file verification successful');
+              break; // Success - exit retry loop
+            } else {
+              throw new Error('Session file verification failed');
+            }
+          } catch (writeErr) {
+            retries++;
+            log('warn', `Session restoration attempt ${retries}/${maxRetries} failed: ${writeErr.message}`);
+            
+            if (retries >= maxRetries) {
+              log('error', `❌ Failed to restore session after ${maxRetries} attempts`);
+            } else {
+              // Wait before retry with exponential backoff
+              const delay = 1000 * Math.pow(2, retries);
+              log('info', `⏱️ Waiting ${delay}ms before retry...`);
+              await new Promise(resolve => setTimeout(resolve, delay));
+            }
+          }
+        }
+        
+        // Signal that we've successfully restored the session
+        log('info', '🎉 Session restoration process completed successfully');
+      } else {
+        log('info', '❓ No session data found in Supabase');
+      }
+    } catch (err) {
+      log('error', `❌ Error in afterInit: ${err.message}`);
+      log('error', err.stack);
+    }
+  }
+  
+  async save(session) {
+    // Check if session is valid and has sufficient data
+    if (!session || JSON.stringify(session).length < 5000) {
+      log('warn', '⚠️ Session data appears too small or invalid');
+      
+      // Skip trying all other methods and go straight to direct localStorage extraction
+      if (this.client && this.client.pupPage) {
+        try {
+          log('info', 'Attempting direct localStorage extraction as last resort');
+          
+          // Check if page is still responsive
+          const isPageAlive = await this.client.pupPage.evaluate(() => true).catch(() => false);
+          if (!isPageAlive) {
+            log('warn', '⚠️ Puppeteer page is no longer responsive, cannot extract data directly');
+            return;
+          }
+          
+          const rawLocalStorage = await this.client.pupPage.evaluate(() => {
+            const data = {};
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              data[key] = localStorage.getItem(key);
+            }
+            return data;
+          }).catch(err => {
+            log('error', `Direct localStorage evaluation failed: ${err.message}`);
+            return null;
+          });
+          
+          if (rawLocalStorage && Object.keys(rawLocalStorage).length > 5) {
+            session = rawLocalStorage;
+            const newSize = JSON.stringify(session).length;
+            log('info', `Found better session data via direct extraction (${newSize} bytes)`);
+            
+            // Only continue if the extracted data is valid
+            if (newSize < 1000) {
+              log('warn', `Extracted session still too small (${newSize} bytes), aborting save`);
+              return;
+            }
+          } else {
+            log('warn', 'Direct extraction found too few items, aborting save');
+            return;
+          }
+        } catch (e) {
+          log('error', `Last resort extraction failed: ${e.message}`);
+          return;
+        }
+      } else {
+        log('warn', 'No client or pupPage available for extraction, aborting save');
+        return;
+      }
+    }
+    
+    // Save locally using the parent method if available
+    try {
+      if (typeof super.save === 'function') {
+        await super.save(session);
+      } else {
+        log('warn', 'Parent save method not available, skipping local save');
+        
+        // Try manual save to local storage
+        try {
+          const sessionDir = path.join(this.dataPath, 'session-' + this.sessionId);
+          if (!fs.existsSync(sessionDir)) {
+            fs.mkdirSync(sessionDir, { recursive: true });
+          }
+          
+          await fs.promises.writeFile(
+            path.join(sessionDir, 'session.json'),
+            JSON.stringify(session),
+            { encoding: 'utf8' }
+          );
+          log('info', '✅ Session manually saved to local storage');
+        } catch (writeErr) {
+          log('error', `Failed to manually write session to local storage: ${writeErr.message}`);
+        }
+      }
+    } catch (err) {
+      log('error', `Failed to save session locally: ${err.message}`);
+      // Continue anyway to try Supabase save
+    }
+    
+    // Then save to Supabase
+    try {
+      const sessionSize = JSON.stringify(session).length;
+      log('info', `Saving session to Supabase (${sessionSize} bytes)`);
+      
+      // One final check before saving to Supabase
+      if (sessionSize < 5000) {
+        log('warn', `Session is still too small (${sessionSize} bytes), skipping Supabase save`);
+        return;
+      }
+      
+      const { error } = await this.supabase
+        .from('whatsapp_sessions')
+        .upsert({
+          session_key: this.sessionId,
+          session_data: session,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'session_key' });
+      
+      if (error) throw new Error(error.message);
+      log('info', '✅ Session saved to Supabase');
+      
+      // Also create a backup copy
+      await this.supabase
+        .from('whatsapp_sessions')
+        .upsert({
+          session_key: `${this.sessionId}_backup`,
+          session_data: session,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'session_key' });
+      
+      log('info', '📥 Created session backup');
+    } catch (err) {
+      log('error', `⚠️ Failed to save session to Supabase: ${err.message}`);
+    }
+  }
+
+  async delete() {
+    // Delete from Supabase
+    try {
+      const { error } = await this.supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('session_key', this.sessionId);
+      
+      if (error) {
+        log('error', `Failed to delete session from Supabase: ${error.message}`);
+      } else {
+        log('info', '✅ Session deleted from Supabase');
+      }
+      
+      // Also delete backup if it exists
+      await this.supabase
+        .from('whatsapp_sessions')
+        .delete()
+        .eq('session_key', `${this.sessionId}_backup`);
+    } catch (err) {
+      log('error', `Failed to delete session from Supabase: ${err.message}`);
+    }
+    
+    // Delete local session
+    return super.delete();
+  }
+}
+
+const supabaseStore = client.authStrategy?.store;
       if (supabaseStore && typeof supabaseStore.validateSession === 'function') {
         const isValid = await supabaseStore.validateSession(sessionData);
         if (!isValid) {
@@ -474,12 +756,11 @@ function createWhatsAppClient() {
     }
 
     return new Client({
-      authStrategy: new RemoteAuth({
-        clientId: SESSION_ID,
-        store: supabaseStore,
-        backupSyncIntervalMs: 300000,
-        dataPath: sessionPath,
-      }),
+      authStrategy: new EnhancedLocalAuth({
+      supabase,
+      sessionId: SESSION_ID,
+      dataPath: path.join(__dirname, `.wwebjs_auth`),
+    }),
       puppeteer: {
         headless: true,
         args: [
