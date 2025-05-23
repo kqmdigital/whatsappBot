@@ -25,15 +25,15 @@ const HUMAN_CONFIG = {
   // Random delays (in milliseconds)
   MIN_READ_DELAY: 2000,        // Minimum time before "reading" a message
   MAX_READ_DELAY: 15000,       // Maximum time before "reading" a message
-  MIN_RESPONSE_DELAY: 3000,    // Minimum time before processing/responding
-  MAX_RESPONSE_DELAY: 30000,   // Maximum time before processing/responding
+  MIN_RESPONSE_DELAY: 1000,    // Minimum time before processing/responding
+  MAX_RESPONSE_DELAY: 10000,   // Maximum time before processing/responding
   MIN_TYPING_DURATION: 1000,   // Minimum typing indicator duration
   MAX_TYPING_DURATION: 5000,   // Maximum typing indicator duration
   
   // Rate limiting
-  MAX_MESSAGES_PER_HOUR: 70,   // Maximum messages to process per hour
-  MAX_MESSAGES_PER_DAY: 420,   // Maximum messages to process per day
-  COOLDOWN_BETWEEN_ACTIONS: 1000, // Minimum time between any actions
+  MAX_MESSAGES_PER_HOUR: 80,   // Maximum messages to process per hour
+  MAX_MESSAGES_PER_DAY: 480,   // Maximum messages to process per day
+  COOLDOWN_BETWEEN_ACTIONS: 250, // Minimum time between any actions
   
   // Activity patterns (24-hour format)
   ACTIVE_HOURS_START: 7,       // Start being active at 7 AM
