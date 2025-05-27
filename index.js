@@ -45,7 +45,7 @@ const HUMAN_CONFIG = {
    SESSION_BREAK_DURATION: 1000, // 1 second
   
   // Message patterns
-  IGNORE_PROBABILITY: 0.05,    // 5% chance to ignore a message (simulate human oversight)
+  IGNORE_PROBABILITY: 0,    // 5% chance to ignore a message (simulate human oversight)
   DOUBLE_CHECK_PROBABILITY: 0.1, // 10% chance to re-read a message
 };
 
