@@ -32,7 +32,7 @@ const HUMAN_CONFIG = {
   
   // Rate limiting
   MAX_MESSAGES_PER_HOUR: 80,   // Maximum messages to process per hour
-  MAX_MESSAGES_PER_DAY: 480,   // Maximum messages to process per day
+  MAX_MESSAGES_PER_DAY: 680,   // Maximum messages to process per day
   COOLDOWN_BETWEEN_ACTIONS: 250, // Minimum time between any actions
   
   // Activity patterns (24-hour format)
