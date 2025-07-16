@@ -16,6 +16,7 @@ const startedAt = Date.now();
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
 const INTEREST_RATE_WEBHOOK_URL = process.env.INTEREST_RATE_WEBHOOK_URL;
 const VALUATION_WEBHOOK_URL = process.env.VALUATION_WEBHOOK_URL;
+const UPDATE_RATE_WEBHOOK_URL = process.env.UPDATE_RATE_WEBHOOK_URL;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -296,6 +297,13 @@ class HumanBehaviorManager {
       webhooks.push({ url: INTEREST_RATE_WEBHOOK_URL, type: 'interest_rate' });
     }
 
+    // Handle bank rates update messages
+    if (payload.messageType === 'bank_rates_update' && UPDATE_RATE_WEBHOOK_URL) {
+      webhooks.push({ url: UPDATE_RATE_WEBHOOK_URL, type: 'bank_rates_update' });
+      log('info', '🏦 Processing bank rates update request for specific n8n workflow');
+    }
+
+    // Send to main N8N webhook (this will receive all message types)
     if (N8N_WEBHOOK_URL) {
       webhooks.push({ url: N8N_WEBHOOK_URL, type: 'main' });
     }
@@ -338,6 +346,7 @@ console.log('🔍 Loaded Webhook URLs:');
 console.log('- N8N_WEBHOOK_URL:', N8N_WEBHOOK_URL);
 console.log('- INTEREST_RATE_WEBHOOK_URL:', INTEREST_RATE_WEBHOOK_URL);
 console.log('- VALUATION_WEBHOOK_URL:', VALUATION_WEBHOOK_URL);
+console.log('- UPDATE_RATE_WEBHOOK_URL:', UPDATE_RATE_WEBHOOK_URL);
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('❌ Missing Supabase credentials. Exiting.');
@@ -963,10 +972,15 @@ async function handleIncomingMessage(msg) {
     (hasReply && replyInfo?.text?.toLowerCase().includes('valuation request'));
 
   const isInterestRateMessage = 
-    text.toLowerCase().includes('keyquest mortgage team')
+    text.toLowerCase().includes('keyquest mortgage team');
+
+  // NEW: Check for bank rates update trigger
+  const isBankRatesUpdateMessage = 
+    text.toLowerCase().includes('update bank rates') ||
+    (hasReply && replyInfo?.text?.toLowerCase().includes('update bank rates'));
 
   // Skip if message doesn't match any trigger conditions
-  if (!isValuationMessage && !isInterestRateMessage) {
+  if (!isValuationMessage && !isInterestRateMessage && !isBankRatesUpdateMessage) {
     log('info', '🚫 Ignored message - no trigger keywords found.');
     return;
   }
@@ -984,6 +998,15 @@ async function handleIncomingMessage(msg) {
     log('info', '💰 Interest rate message detected (direct mention)');
   }
 
+  // NEW: Log bank rates update trigger
+  if (isBankRatesUpdateMessage) {
+    if (text.toLowerCase().includes('update bank rates')) {
+      log('info', '🏦 Bank rates update message detected (direct mention)');
+    } else if (hasReply && replyInfo?.text?.toLowerCase().includes('update bank rates')) {
+      log('info', '🏦 Bank rates update message detected (reply to update bank rates)');
+    }
+  }
+
   // Memory logging every 50 messages
   messageCount++;
   if (messageCount % 50 === 0) {
@@ -997,6 +1020,16 @@ async function handleIncomingMessage(msg) {
     }
   }
 
+  // Determine message type with priority: bank_rates_update > valuation > interest_rate
+  let messageType;
+  if (isBankRatesUpdateMessage) {
+    messageType = 'bank_rates_update';
+  } else if (isValuationMessage) {
+    messageType = 'valuation';
+  } else {
+    messageType = 'interest_rate';
+  }
+
   const payload = {
     groupId,
     senderId,
@@ -1004,7 +1037,7 @@ async function handleIncomingMessage(msg) {
     messageId,
     hasReply,
     replyInfo,
-    messageType: isValuationMessage ? 'valuation' : 'interest_rate',
+    messageType,
     timestamp: new Date(msg.timestamp * 1000).toISOString(),
   };
 
@@ -1380,6 +1413,7 @@ app.get('/health', async (_, res) => {
         n8n: !!N8N_WEBHOOK_URL,
         valuation: !!VALUATION_WEBHOOK_URL,
         interest_rate: !!INTEREST_RATE_WEBHOOK_URL,
+        update_rate: !!UPDATE_RATE_WEBHOOK_URL,
       },
       timestamp: new Date().toISOString(),
     };
