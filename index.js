@@ -976,8 +976,7 @@ async function handleIncomingMessage(msg) {
 
   // NEW: Check for bank rates update trigger
   const isBankRatesUpdateMessage = 
-    text.toLowerCase().includes('update bank rates') ||
-    (hasReply && replyInfo?.text?.toLowerCase().includes('update bank rates'));
+    text.toLowerCase().includes('update bank rates');
 
   // Skip if message doesn't match any trigger conditions
   if (!isValuationMessage && !isInterestRateMessage && !isBankRatesUpdateMessage) {
