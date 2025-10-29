@@ -6,6 +6,9 @@ const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
+// Get whatsapp-web.js version
+const waWebVersion = require('whatsapp-web.js/package.json').version;
+
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
@@ -1468,6 +1471,7 @@ app.get('/health', async (_, res) => {
     const health = {
       status: clientState === 'CONNECTED' && supabaseStatus === 'CONNECTED' ? 'healthy' : 'degraded',
       version: BOT_VERSION,
+      waWebJsVersion: waWebVersion,
       uptime: {
         seconds: Math.floor((Date.now() - startedAt) / 1000),
         readable: formatUptime(Date.now() - startedAt),
@@ -1515,6 +1519,7 @@ app.get('/ping', (_, res) => {
 const server = app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
   log('info', `🤖 Bot Version: ${BOT_VERSION} (Enhanced Anti-Restriction)`);
+  log('info', `📦 WhatsApp Web.js Version: ${waWebVersion}`);
   log('info', `🧠 Human behavior: ${HUMAN_CONFIG.MAX_MESSAGES_PER_HOUR}/hr, ${HUMAN_CONFIG.MAX_MESSAGES_PER_DAY}/day limits`);
   log('info', `🎭 User Agent: ${CURRENT_USER_AGENT.substring(0, 60)}...`);
   log('info', `🛡️ Enhanced stealth: AutomationControlled disabled, realistic browser profile`);
