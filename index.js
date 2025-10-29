@@ -9,8 +9,19 @@ const { createClient } = require('@supabase/supabase-js');
 // --- Config ---
 const PORT = process.env.PORT || 3000;
 const SESSION_ID = process.env.WHATSAPP_SESSION_ID || 'default_session';
-const BOT_VERSION = '1.0.1';
+const BOT_VERSION = '1.1.0';
 const startedAt = Date.now();
+
+// User agents for rotation (real browser user agents)
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+];
+
+// Select random user agent for this session
+const CURRENT_USER_AGENT = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 
 // Multiple webhook URLs support
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL;
@@ -31,10 +42,10 @@ const HUMAN_CONFIG = {
   MIN_TYPING_DURATION: 1000,   // Minimum typing indicator duration
   MAX_TYPING_DURATION: 5000,   // Maximum typing indicator duration
   
-  // Rate limiting
-  MAX_MESSAGES_PER_HOUR: 80,   // Maximum messages to process per hour
-  MAX_MESSAGES_PER_DAY: 680,   // Maximum messages to process per day
-  COOLDOWN_BETWEEN_ACTIONS: 250, // Minimum time between any actions
+  // Rate limiting (more conservative to reduce restriction risk)
+  MAX_MESSAGES_PER_HOUR: 60,   // Maximum messages to process per hour
+  MAX_MESSAGES_PER_DAY: 500,   // Maximum messages to process per day
+  COOLDOWN_BETWEEN_ACTIONS: 500, // Minimum time between any actions (increased)
   
   // Activity patterns (24-hour format)
   ACTIVE_HOURS_START: 7,       // Start being active at 7 AM
@@ -693,7 +704,7 @@ class SupabaseStore {
     }
 
     const requiredKeys = ['WABrowserId', 'WASecretBundle', 'WAToken1', 'WAToken2'];
-    const hasRequiredKeys = requiredKeys.some(key => 
+    const hasRequiredKeys = requiredKeys.some(key =>
       Object.keys(sessionData).some(dataKey => dataKey.includes(key))
     );
 
@@ -709,6 +720,50 @@ class SupabaseStore {
     }
 
     return true;
+  }
+
+  // Session health check
+  async checkSessionHealth() {
+    try {
+      const sessionData = await this.extract({ session: this.sessionId });
+
+      if (!sessionData) {
+        log('warn', '🔍 Session health check: No session data found');
+        return { healthy: false, reason: 'no_data' };
+      }
+
+      const isValid = await this.validateSession(sessionData);
+      if (!isValid) {
+        log('warn', '🔍 Session health check: Invalid session data');
+        return { healthy: false, reason: 'invalid_data' };
+      }
+
+      // Check if session was updated recently (within last 24 hours)
+      const { data, error } = await this.supabase
+        .from('whatsapp_sessions')
+        .select('updated_at')
+        .eq('session_key', this.sessionId)
+        .single();
+
+      if (error || !data) {
+        log('warn', '🔍 Session health check: Could not fetch update time');
+        return { healthy: true, reason: 'unknown_age' };
+      }
+
+      const lastUpdate = new Date(data.updated_at);
+      const ageHours = (Date.now() - lastUpdate.getTime()) / (1000 * 60 * 60);
+
+      if (ageHours > 72) {
+        log('warn', `🔍 Session health check: Session is ${ageHours.toFixed(1)} hours old (stale)`);
+        return { healthy: false, reason: 'stale_session', age: ageHours };
+      }
+
+      log('info', `✅ Session health check: Healthy (age: ${ageHours.toFixed(1)} hours)`);
+      return { healthy: true, age: ageHours };
+    } catch (err) {
+      log('error', `Session health check failed: ${err.message}`);
+      return { healthy: false, reason: 'check_error', error: err.message };
+    }
   }
 }
 
@@ -816,6 +871,12 @@ function createWhatsAppClient() {
           '--disable-gpu',
           '--js-flags=--max-old-space-size=256',
           '--disable-extensions',
+          // Enhanced stealth configuration
+          '--disable-blink-features=AutomationControlled',
+          '--disable-features=IsolateOrigins,site-per-process',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor',
+          `--user-agent=${CURRENT_USER_AGENT}`,
         ],
         timeout: 120000,
       },
@@ -1372,6 +1433,23 @@ app.get('/human-status', (req, res) => {
   });
 });
 
+// Session health check endpoint
+app.get('/session-health', async (req, res) => {
+  try {
+    const healthStatus = await supabaseStore.checkSessionHealth();
+    res.status(200).json({
+      success: true,
+      health: healthStatus,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
 // Health check endpoint
 app.get('/health', async (_, res) => {
   try {
@@ -1397,6 +1475,7 @@ app.get('/health', async (_, res) => {
       whatsapp: {
         state: clientState,
         ready: client ? true : false,
+        userAgent: CURRENT_USER_AGENT.substring(0, 50) + '...',
       },
       supabase: supabaseStatus,
       humanBehavior: humanBehavior.getStatus(),
@@ -1435,16 +1514,20 @@ app.get('/ping', (_, res) => {
 // Start server
 const server = app.listen(PORT, () => {
   log('info', `🚀 Server started on http://localhost:${PORT}`);
-  log('info', `🤖 Bot Version: ${BOT_VERSION}`);
-  log('info', `🧠 Human behavior enabled with smart timing and rate limiting`);
-  log('info', '💻 Starting WhatsApp client in 5 seconds...');
-  
+  log('info', `🤖 Bot Version: ${BOT_VERSION} (Enhanced Anti-Restriction)`);
+  log('info', `🧠 Human behavior: ${HUMAN_CONFIG.MAX_MESSAGES_PER_HOUR}/hr, ${HUMAN_CONFIG.MAX_MESSAGES_PER_DAY}/day limits`);
+  log('info', `🎭 User Agent: ${CURRENT_USER_AGENT.substring(0, 60)}...`);
+  log('info', `🛡️ Enhanced stealth: AutomationControlled disabled, realistic browser profile`);
+  log('info', '💻 Starting WhatsApp client with random delay...');
+
   // Add random delay before starting client
   const startDelay = humanBehavior.getRandomDelay(3000, 8000);
+  log('info', `⏳ Client will start in ${(startDelay/1000).toFixed(1)} seconds`);
   setTimeout(startClient, startDelay);
 });
 
-// Enhanced Watchdog with human behavior consideration
+// Enhanced Watchdog with human behavior consideration and session health checks
+let watchdogHealthCheckCounter = 0;
 setInterval(async () => {
   if (!client) {
     log('warn', '🕵️ Watchdog: client is missing. Restarting...');
@@ -1468,6 +1551,29 @@ setInterval(async () => {
         }
       } else {
         log('debug', '💤 Skipping session save (break time or inactive hours)');
+      }
+
+      // Perform session health check every 3rd watchdog cycle (24 minutes)
+      watchdogHealthCheckCounter++;
+      if (watchdogHealthCheckCounter >= 3) {
+        watchdogHealthCheckCounter = 0;
+        log('info', '🔍 Running periodic session health check...');
+
+        const healthStatus = await supabaseStore.checkSessionHealth();
+        if (!healthStatus.healthy) {
+          log('warn', `⚠️ Session health check failed: ${healthStatus.reason}`);
+
+          // Attempt recovery for certain conditions
+          if (healthStatus.reason === 'stale_session' || healthStatus.reason === 'invalid_data') {
+            log('info', '🔄 Attempting session recovery...');
+            try {
+              await safelyTriggerSessionSave(client);
+              log('info', '✅ Session recovery save completed');
+            } catch (recoveryErr) {
+              log('error', `Session recovery failed: ${recoveryErr.message}`);
+            }
+          }
+        }
       }
     } else {
       log('warn', `⚠️ Watchdog detected bad state "${state}". Restarting client...`);
