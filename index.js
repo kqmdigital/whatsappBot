@@ -4,6 +4,11 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 const axios = require('axios');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// Use stealth plugin
+puppeteer.use(StealthPlugin());
 
 // Get whatsapp-web.js version
 const waWebVersion = require('whatsapp-web.js/package.json').version;
@@ -488,25 +493,23 @@ function createWhatsAppClient() {
         clientId: SESSION_ID,
         dataPath: sessionPath,
       }),
-      puppeteer: {
+      puppeteer: puppeteer,
+      puppeteerOptions: {
         headless: true,
         args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
+          // Critical anti-detection
+          '--disable-blink-features=AutomationControlled',
+          `--user-data-dir=${path.join(__dirname, '.wwebjs_chrome_profile')}`,
+          '--window-size=1920,1080',
+          `--user-agent=${CURRENT_USER_AGENT}`,
+
+          // Safe performance flags
           '--disable-dev-shm-usage',
           '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
           '--disable-gpu',
-          '--js-flags=--max-old-space-size=256',
-          '--disable-extensions',
-          // Enhanced stealth configuration
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-web-security',
-          '--disable-features=VizDisplayCompositor',
-          `--user-agent=${CURRENT_USER_AGENT}`,
+
+          // Increased memory
+          '--js-flags=--max-old-space-size=512',
         ],
         timeout: 120000,
       },
